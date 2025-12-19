@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { ArrowRight, X, Check, AlertCircle, ChevronRight, ChevronLeft, CheckCircle, ChevronDown, Search } from 'lucide-react';
+import { ArrowRight, X, Check, AlertCircle, ChevronRight, ChevronLeft, CheckCircle, ChevronDown, ChevronUp, Search } from 'lucide-react';
 import { getShareTribeMetadata } from '../services/api';
 
 const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel, onConfirm, isEbayProducts = false }) => {
@@ -56,11 +56,15 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
   const [step, setStep] = useState(1); // 1: Default fields, 2: Category mapping, 3: Value validation, 4: Category fields, 5: Final validation & unmapped fields
   const [defaultMappings, setDefaultMappings] = useState({}); // Maps CSV columns to default fields (title, description, etc.)
   const [categoryColumn, setCategoryColumn] = useState(null); // Which CSV column contains category IDs
-  const [categoryFieldMappings, setCategoryFieldMappings] = useState({}); // Maps category ID -> { field mappings }
+  const [categoryFieldMappings, setCategoryFieldMappings] = useState({}); // Maps category ID -> { field mappings } (used for Step 4, kept for backward compatibility)
   const [categoryShareTribeMappings, setCategoryShareTribeMappings] = useState({}); // Maps CSV category ID -> ShareTribe category
   const [categoryListingTypeMappings, setCategoryListingTypeMappings] = useState({}); // Maps CSV category ID -> ShareTribe listing type ID
   const [valueMappings, setValueMappings] = useState({}); // Maps: "categoryId:fieldId:csvValue" -> "shareTribeValue"
-  const [unmappedFieldValues, setUnmappedFieldValues] = useState({}); // Maps: "categoryId:fieldId" -> "defaultValue"
+  const [unmappedFieldValues, setUnmappedFieldValues] = useState({}); // Maps: "categoryId:fieldId" -> "defaultValue" (kept for backward compatibility)
+  // Product-level mappings (for Step 5)
+  const [productFieldMappings, setProductFieldMappings] = useState({}); // Maps: "productId:csvColumn" -> "shareTribeFieldId"
+  const [productUnmappedFieldValues, setProductUnmappedFieldValues] = useState({}); // Maps: "productId:fieldId" -> "defaultValue"
+  const [expandedCategories, setExpandedCategories] = useState({}); // Track which category groups are expanded
   const [errors, setErrors] = useState({});
   const [availableFields, setAvailableFields] = useState([]);
   const [availableCategories, setAvailableCategories] = useState([]);
@@ -245,7 +249,7 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
             return prevMappings; // Don't overwrite existing mappings
           }
           
-          const autoMappings = {};
+    const autoMappings = {};
           if (safeCsvColumns && safeCsvColumns.length > 0) {
             safeCsvColumns.forEach(csvCol => {
               const normalizedCsvCol = csvCol.toLowerCase().trim();
@@ -327,6 +331,9 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
       setCategorySearchOpen({});
       setCategorySearchTerm({});
       setUnmappedFieldValues({});
+      setProductFieldMappings({});
+      setProductUnmappedFieldValues({});
+      setExpandedCategories({});
       console.log('Reset CSV mapping state for new file:', fileId);
     }
   }, [fileId]);
@@ -414,6 +421,62 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
     setCategoryFieldMappings(newMappings);
   };
 
+  // Get product ID from a row (for product-level mappings)
+  const getProductId = useCallback((row) => {
+    // For eBay products, use ebay_item_id
+    if (isEbayProducts && row.ebay_item_id) {
+      return row.ebay_item_id;
+    }
+    // For CSV, try to find a unique identifier
+    // Check common ID fields
+    const idFields = ['id', 'item_id', 'product_id', 'sku', 'ebay_item_id'];
+    for (const field of idFields) {
+      if (row[field]) {
+        return String(row[field]);
+      }
+    }
+    // Fallback: use a combination of title and first available column
+    const title = row.title || row.Title || '';
+    const firstCol = safeCsvColumns.find(col => row[col]);
+    return `${title}_${firstCol || 'unknown'}`;
+  }, [isEbayProducts, safeCsvColumns]);
+
+  // Handle product-level field mapping
+  const handleProductFieldMapping = (productId, csvColumn, targetField) => {
+    const newMappings = { ...productFieldMappings };
+    const mappingKey = `${productId}:${csvColumn}`;
+    
+    if (targetField) {
+      newMappings[mappingKey] = targetField;
+    } else {
+      delete newMappings[mappingKey];
+    }
+    
+    setProductFieldMappings(newMappings);
+  };
+
+  // Handle product-level unmapped field value
+  const handleProductUnmappedFieldValue = (productId, fieldId, defaultValue) => {
+    const newValues = { ...productUnmappedFieldValues };
+    const valueKey = `${productId}:${fieldId}`;
+    
+    if (defaultValue && String(defaultValue).trim() !== '') {
+      newValues[valueKey] = defaultValue;
+    } else {
+      delete newValues[valueKey];
+    }
+    
+    setProductUnmappedFieldValues(newValues);
+  };
+
+  // Toggle category expansion
+  const toggleCategoryExpansion = (csvCategoryId) => {
+    setExpandedCategories(prev => ({
+      ...prev,
+      [csvCategoryId]: !prev[csvCategoryId]
+    }));
+  };
+
   // Validation function that doesn't set state (for use during render)
   // Note: ebay_item_id is automatically extracted from CSV, no validation needed
   const isValidStep1 = React.useMemo(() => {
@@ -493,67 +556,72 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
   }, [groupedFields, getCategoryHierarchy]);
 
   // Check if there are unmapped required ShareTribe fields (for Step 5)
-  // This checks if required fields are either mapped OR have default values set
+  // This checks product-level mappings to see if any product has unmapped required fields
   const hasUnmappedRequiredFields = useMemo(() => {
     if (step !== 5) return false;
     if (!categoryColumn) return false; // Can't check if no category column selected
+    if (!groupedFields || !groupedFields.listing) return false; // Fields not loaded yet
+    if (!safeSampleRows || !Array.isArray(safeSampleRows) || safeSampleRows.length === 0) return false;
     
     try {
-      const uniqueCategories = getUniqueCSVCategories();
-      if (!uniqueCategories || uniqueCategories.length === 0) return false;
-    
-    for (const csvCategoryId of uniqueCategories) {
-      const categoryMapping = categoryShareTribeMappings[csvCategoryId];
-      const shareTribeCategoryId = categoryMapping?.categoryId;
-      const categoryFieldMapping = categoryFieldMappings[csvCategoryId] || {};
-      
-      if (!shareTribeCategoryId) continue;
-      
-      // Get applicable fields for this category
-      let applicableFields = [];
-      try {
-        applicableFields = getFieldsForCategory(shareTribeCategoryId);
-      } catch (error) {
-        console.error(`Error getting fields for category ${shareTribeCategoryId}:`, error);
-        continue; // Skip this category if there's an error
-      }
-      
-      if (!applicableFields || !Array.isArray(applicableFields)) {
-        continue; // Skip if no fields available
-      }
-      
-      // Find unmapped required ShareTribe fields
-      const mappedFieldIds = new Set([
-        ...Object.values(defaultMappings),
-        ...Object.values(categoryFieldMapping)
-      ]);
-      
-      const unmappedRequired = applicableFields.filter(field => {
-        // Skip if already mapped
-        if (mappedFieldIds.has(field.id)) return false;
-        // Skip if it's a default field (already handled in Step 1)
-        if (field.group === 'default') return false;
-        // Only check required fields
-        return field.required === true;
-      });
-      
-      // Check if required fields have default values set
-      for (const field of unmappedRequired) {
-        const fieldKey = `${csvCategoryId}:${field.id}`;
-        const defaultValue = unmappedFieldValues[fieldKey];
-        // If no default value is set (or it's empty), it's still unmapped
-        if (!defaultValue || String(defaultValue).trim() === '') {
-          return true; // Found an unmapped required field
+      // Check each product individually
+      for (const row of safeSampleRows) {
+        if (!row || !row[categoryColumn]) continue;
+        
+        const csvCategoryId = String(row[categoryColumn]).trim();
+        if (!csvCategoryId) continue;
+        
+        const categoryMapping = categoryShareTribeMappings[csvCategoryId];
+        const shareTribeCategoryId = categoryMapping?.categoryId;
+        
+        if (!shareTribeCategoryId) continue;
+        
+        const productId = getProductId(row);
+        
+        // Get applicable fields for this category
+        let applicableFields = [];
+        try {
+          applicableFields = getFieldsForCategory(shareTribeCategoryId);
+        } catch (error) {
+          console.error(`Error getting fields for category ${shareTribeCategoryId}:`, error);
+          continue;
+        }
+        
+        if (!applicableFields || !Array.isArray(applicableFields)) continue;
+        
+        // Get all mapped field IDs for this product (default + category + product-level)
+        const mappedFieldIds = new Set([
+          ...Object.values(defaultMappings),
+          ...Object.values(categoryFieldMappings[csvCategoryId] || {}),
+          ...Object.keys(productFieldMappings)
+            .filter(key => key.startsWith(`${productId}:`))
+            .map(key => productFieldMappings[key])
+        ]);
+        
+        // Find unmapped required ShareTribe fields for this product
+        const unmappedRequired = applicableFields.filter(field => {
+          if (mappedFieldIds.has(field.id)) return false;
+          if (field.group === 'default') return false;
+          return field.required === true;
+        });
+        
+        // Check if required fields have values set (product-level)
+        for (const field of unmappedRequired) {
+          const valueKey = `${productId}:${field.id}`;
+          const defaultValue = productUnmappedFieldValues[valueKey];
+          // If no default value is set (or it's empty), it's still unmapped
+          if (!defaultValue || String(defaultValue).trim() === '') {
+            return true; // Found a product with unmapped required field
+          }
         }
       }
-    }
-    
-    return false; // All required fields are either mapped or have default values
+      
+      return false; // All products have required fields mapped and valid enum values
     } catch (error) {
       console.error('Error checking unmapped required fields:', error);
       return false; // Don't block import if there's an error checking
     }
-  }, [step, categoryColumn, categoryShareTribeMappings, categoryFieldMappings, defaultMappings, unmappedFieldValues, getFieldsForCategory, getUniqueCSVCategories]);
+  }, [step, categoryColumn, categoryShareTribeMappings, categoryFieldMappings, defaultMappings, productUnmappedFieldValues, valueMappings, getFieldsForCategory, safeSampleRows, getProductId, groupedFields, availableFields]);
 
   const canProceedToStep3 = useMemo(() => {
     return uniqueCategories.length > 0 && uniqueCategories.every(catId => categoryShareTribeMappings[catId]);
@@ -639,10 +707,12 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
       defaultMappings,
       categoryColumn,
       categoryShareTribeMappings,
-      categoryFieldMappings,
+      categoryFieldMappings, // Keep for backward compatibility (Step 4)
       categoryListingTypeMappings, // Include listing type mappings
       valueMappings, // Include value mappings for invalid enum values
-      unmappedFieldValues // Include default values for unmapped ShareTribe fields
+      unmappedFieldValues, // Keep for backward compatibility
+      productFieldMappings, // Product-level field mappings (Step 5)
+      productUnmappedFieldValues // Product-level unmapped field values (Step 5)
     });
   };
 
@@ -663,18 +733,18 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
         {/* Header */}
         <div className="px-6 py-4 border-b border-gray-200">
           <div className="flex justify-between items-center mb-4">
-            <div>
+          <div>
               <h2 className="text-xl font-semibold text-gray-900">{isEbayProducts ? 'Mapping Modal' : 'Map CSV Columns'}</h2>
-              <p className="text-sm text-gray-500 mt-1">
+            <p className="text-sm text-gray-500 mt-1">
                 Step {step} of 5: {step === 1 ? 'Map Default Fields' : step === 2 ? 'Map Categories' : step === 3 ? 'Validate Values' : step === 4 ? 'Map Category-Specific Fields' : 'Final Validation & Unmapped Fields'}
-              </p>
-            </div>
-            <button
-              onClick={onCancel}
-              className="text-gray-400 hover:text-gray-600"
-            >
-              <X size={24} />
-            </button>
+            </p>
+          </div>
+          <button
+            onClick={onCancel}
+            className="text-gray-400 hover:text-gray-600"
+          >
+            <X size={24} />
+          </button>
           </div>
           
           {/* Progress Steps */}
@@ -731,21 +801,21 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
 
               {/* Note: eBay Item ID is automatically extracted from CSV and stored in ShareTribe privateData */}
 
-              <div className="space-y-4">
-                <div className="grid grid-cols-12 gap-4 pb-2 border-b border-gray-200 font-semibold text-sm text-gray-700">
-                  <div className="col-span-5">CSV Column</div>
-                  <div className="col-span-1"></div>
+          <div className="space-y-4">
+            <div className="grid grid-cols-12 gap-4 pb-2 border-b border-gray-200 font-semibold text-sm text-gray-700">
+              <div className="col-span-5">CSV Column</div>
+              <div className="col-span-1"></div>
                   <div className="col-span-6">ShareTribe Default Field</div>
-                </div>
+            </div>
 
                 {safeCsvColumns.map(csvColumn => {
                   const mappedField = defaultMappings[csvColumn];
                   const sampleValue = safeSampleRows[0]?.[csvColumn] || '';
-                  
-                  return (
+              
+              return (
                     <div key={csvColumn} className="grid grid-cols-12 gap-4 items-center">
-                      <div className="col-span-5">
-                        <div className="px-3 py-2 bg-gray-50 rounded-lg border border-gray-200">
+                  <div className="col-span-5">
+                    <div className="px-3 py-2 bg-gray-50 rounded-lg border border-gray-200">
                           <div className="font-medium text-gray-900 mb-1">{csvColumn}</div>
                           {sampleValue && (
                             <div className="text-xs text-gray-600 break-words mt-1">
@@ -753,11 +823,11 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
                               <span className="font-mono">{sampleValue}</span>
                             </div>
                           )}
-                        </div>
-                      </div>
-                      <div className="col-span-1 flex justify-center">
-                        <ArrowRight className="text-gray-400" size={20} />
-                      </div>
+                    </div>
+                  </div>
+                  <div className="col-span-1 flex justify-center">
+                    <ArrowRight className="text-gray-400" size={20} />
+                  </div>
                       <div className="col-span-6">
                         <select
                           value={mappedField || ''}
@@ -1108,7 +1178,7 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
                       {invalidValueMappings.map((item, idx) => (
                         <div key={idx} className="border border-red-200 rounded-lg p-4 bg-red-50">
                           <div className="grid grid-cols-12 gap-4 items-center">
-                            <div className="col-span-5">
+                  <div className="col-span-5">
                               <div className="space-y-1">
                                 <div className="font-medium text-gray-900">
                                   {item.csvColumn} (sample: &quot;{item.csvValue}&quot;)
@@ -1340,8 +1410,8 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
                                 <ArrowRight className="text-gray-400" size={20} />
                               </div>
                               <div className="col-span-6">
-                                <select
-                                  value={currentMapping || ''}
+                    <select
+                      value={currentMapping || ''}
                                   onChange={(e) => handleCategoryFieldMapping(csvCategoryId, csvColumn, e.target.value || null)}
                                   className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                                 >
@@ -1351,95 +1421,107 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
                                     <optgroup label={`Listing Fields${shareTribeCategoryId ? ` (for ${categoryMapping?.categoryPath || csvCategoryId})` : ''}`}>
                                       {applicableFields.map(field => {
                                         const isMapped = Object.values(categoryFieldMapping).includes(field.id) && categoryFieldMapping[csvColumn] !== field.id;
-                                        return (
-                                          <option 
-                                            key={field.id} 
-                                            value={field.id}
-                                            disabled={isMapped}
-                                          >
-                                            {field.label} {field.required && '*'}
-                                            {isMapped && ' (already mapped)'}
-                                          </option>
-                                        );
-                                      })}
+                        return (
+                          <option 
+                            key={field.id} 
+                            value={field.id}
+                            disabled={isMapped}
+                          >
+                            {field.label} {field.required && '*'}
+                            {isMapped && ' (already mapped)'}
+                          </option>
+                        );
+                      })}
                                     </optgroup>
                                   )}
                                   {applicableFields.length === 0 && shareTribeCategoryId && (
                                     <option disabled>No fields available for this category</option>
                                   )}
-                                </select>
-                              </div>
-                            </div>
+                    </select>
+                  </div>
+                  </div>
                           );
                         })}
                       </div>
                     )}
-                  </div>
-                );
-              })}
-            </div>
+                </div>
+              );
+            })}
+          </div>
           )}
 
-          {/* Step 5: Final Validation & Unmapped Fields */}
+          {/* Step 5: Final Review - Product-Level Mappings */}
           {step === 5 && (() => {
-            // Collect all validation issues and unmapped fields
-            const validationIssues = [];
-            const unmappedFieldsByCategory = {};
+            // Group products by category
+            const productsByCategory = {};
             
-            // Get all unique values from CSV preview if available (more comprehensive than sampleRows)
-            // Use csvPreview.uniqueValues if available (scans all rows), otherwise use sampleRows
-            const allCSVValues = (() => {
-              const valuesByCategoryAndColumn = {};
+            if (!categoryColumn || !safeSampleRows || !Array.isArray(safeSampleRows)) {
+              return (
+                <div className="text-center text-gray-500 py-8">
+                  <p>No products to review. Please complete previous steps first.</p>
+                </div>
+              );
+            }
+            
+            // Group products by category
+            safeSampleRows.forEach((row, idx) => {
+              if (!row || !row[categoryColumn]) return;
               
-              // Try to use csvPreview.uniqueValues first (if it exists and has the structure we need)
-              // Otherwise fall back to sampleRows
-              let dataSource = sampleRows || [];
+              const csvCategoryId = String(row[categoryColumn]).trim();
+              if (!csvCategoryId) return;
               
-              // If csvPreview has uniqueValues, try to use it
-              // Note: csvPreview.uniqueValues might be structured differently, so we'll use sampleRows as primary
-              // The backend should provide uniqueValues in a structured format if needed
+              const productId = getProductId(row);
               
-              if (categoryColumn && Array.isArray(dataSource)) {
-                dataSource.forEach(row => {
-                  if (!row || !row[categoryColumn]) return;
-                  
-                  const csvCategoryId = String(row[categoryColumn]).trim();
-                  if (!csvCategoryId) return;
-                  
-                  if (!valuesByCategoryAndColumn[csvCategoryId]) {
-                    valuesByCategoryAndColumn[csvCategoryId] = {};
-                  }
-                  
-                  // Collect values from all CSV columns
-                  Object.keys(row).forEach(csvColumn => {
-                    if (csvColumn === categoryColumn) return;
-                    
-                    const value = String(row[csvColumn] || '').trim();
-                    if (value) {
-                      if (!valuesByCategoryAndColumn[csvCategoryId][csvColumn]) {
-                        valuesByCategoryAndColumn[csvCategoryId][csvColumn] = new Set();
-                      }
-                      valuesByCategoryAndColumn[csvCategoryId][csvColumn].add(value);
-                    }
-                  });
-                });
+              if (!productsByCategory[csvCategoryId]) {
+                productsByCategory[csvCategoryId] = [];
               }
               
-              return valuesByCategoryAndColumn;
-            })();
+              productsByCategory[csvCategoryId].push({
+                productId,
+                row,
+                index: idx
+              });
+            });
             
-            // Check all mapped values for validity (both default and category-specific fields)
-            getUniqueCSVCategories().forEach(csvCategoryId => {
+            // Calculate unmapped fields per product
+            const getUnmappedFieldsForProduct = (product, csvCategoryId) => {
               const categoryMapping = categoryShareTribeMappings[csvCategoryId];
               const shareTribeCategoryId = categoryMapping?.categoryId;
-              const categoryFieldMapping = categoryFieldMappings[csvCategoryId] || {};
               
-              if (!shareTribeCategoryId) return;
+              if (!shareTribeCategoryId) return [];
               
-              // Get applicable fields for this category
               const applicableFields = getFieldsForCategory(shareTribeCategoryId);
+              const productId = product.productId;
               
-              // Check default field mappings (from Step 1)
+              // Get all mapped field IDs for this product (default + category-level mappings from Step 4)
+              // Note: Step 5 is only for unmapped ShareTribe fields, not for mapping CSV columns
+              // CSV column mappings are handled at category level in Step 4
+              const mappedFieldIds = new Set([
+                ...Object.values(defaultMappings),
+                ...Object.values(categoryFieldMappings[csvCategoryId] || {})
+              ]);
+              
+              // Find unmapped ShareTribe fields
+              const unmappedFields = applicableFields.filter(field => {
+                // Skip if already mapped
+                if (mappedFieldIds.has(field.id)) return false;
+                // Skip if it's a default field (already handled in Step 1)
+                if (field.group === 'default') return false;
+                // Only show required fields or fields with enum options
+                return field.required || (field.options && field.options.length > 0);
+              });
+              
+              return unmappedFields;
+            };
+            
+            // Get validation issues for a product (invalid enum values)
+            // Returns ALL issues (both unmapped and mapped) so they stay visible
+            const getValidationIssuesForProduct = (product, csvCategoryId) => {
+              const validationIssues = [];
+              const productId = product.productId;
+              const row = product.row;
+              
+              // Check default mappings (Step 1)
               Object.keys(defaultMappings).forEach(csvColumn => {
                 const shareTribeFieldId = defaultMappings[csvColumn];
                 if (!shareTribeFieldId) return;
@@ -1452,53 +1534,42 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
                   return;
                 }
                 
-                // Get all unique values for this CSV column in this category
-                const uniqueValues = allCSVValues[csvCategoryId]?.[csvColumn] || new Set();
+                // Get the value from the product row
+                const csvValue = row[csvColumn];
+                if (!csvValue || String(csvValue).trim() === '') return;
                 
-                // Also check sampleRows as fallback
-                if (uniqueValues.size === 0 && safeSampleRows && Array.isArray(safeSampleRows) && categoryColumn) {
-                  safeSampleRows.forEach(row => {
-                    if (row && row[categoryColumn] === csvCategoryId && row[csvColumn]) {
-                      const value = String(row[csvColumn]).trim();
-                      if (value) {
-                        uniqueValues.add(value);
-                      }
-                    }
+                const value = String(csvValue).trim();
+                
+                // Check if value mapping exists (from Step 3 or Step 5)
+                const mappingKey = `${csvCategoryId}:${shareTribeFieldId}:${value}`;
+                const mappedValue = valueMappings[mappingKey];
+                const finalValue = mappedValue || value;
+                
+                // Check if final value is valid
+                const normalizedFinalValue = String(finalValue).trim();
+                const normalizedOptions = field.options.map(opt => String(opt).trim());
+                const isValid = normalizedOptions.includes(normalizedFinalValue);
+                
+                // Always include the issue if the original value is invalid, even if it's been mapped
+                // This ensures the dropdown stays visible after mapping
+                if (!normalizedOptions.includes(value.trim())) {
+                  validationIssues.push({
+                    csvColumn,
+                    shareTribeFieldId,
+                    shareTribeFieldLabel: field.label || shareTribeFieldId,
+                    csvValue: value,
+                    mappedValue: mappedValue || null,
+                    finalValue: normalizedFinalValue,
+                    allowedValues: field.options,
+                    mappingKey,
+                    isDefaultField: true,
+                    isValid: isValid // Track if the mapped value is valid
                   });
                 }
-                
-                // Validate each value
-                uniqueValues.forEach(csvValue => {
-                  // Check if value mapping exists
-                  const mappingKey = `${csvCategoryId}:${shareTribeFieldId}:${csvValue}`;
-                  const mappedValue = valueMappings[mappingKey];
-                  const finalValue = mappedValue || csvValue;
-                  
-                  // Normalize for comparison (ShareTribe enum values are case-sensitive, but we'll check both)
-                  const normalizedFinalValue = String(finalValue).trim();
-                  const normalizedOptions = field.options.map(opt => String(opt).trim());
-                  
-                  // Validate against allowed options (exact match required)
-                  if (!normalizedOptions.includes(normalizedFinalValue)) {
-                    validationIssues.push({
-                      csvCategoryId,
-                      csvCategoryName: csvCategoryId,
-                      shareTribeCategoryPath: categoryMapping?.categoryPath || csvCategoryId,
-                      csvColumn,
-                      shareTribeFieldId,
-                      shareTribeFieldLabel: field.label || shareTribeFieldId,
-                      csvValue,
-                      mappedValue,
-                      finalValue: normalizedFinalValue,
-                      allowedValues: field.options,
-                      mappingKey,
-                      isDefaultField: true
-                    });
-                  }
-                });
               });
               
-              // Check category-specific field mappings (from Step 4)
+              // Check category-level mappings (Step 4)
+              const categoryFieldMapping = categoryFieldMappings[csvCategoryId] || {};
               Object.keys(categoryFieldMapping).forEach(csvColumn => {
                 const shareTribeFieldId = categoryFieldMapping[csvColumn];
                 if (!shareTribeFieldId) return;
@@ -1511,278 +1582,308 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
                   return;
                 }
                 
-                // Get all unique values for this CSV column in this category
-                const uniqueValues = allCSVValues[csvCategoryId]?.[csvColumn] || new Set();
+                // Get the value from the product row
+                const csvValue = row[csvColumn];
+                if (!csvValue || String(csvValue).trim() === '') return;
                 
-                // Also check sampleRows as fallback
-                if (uniqueValues.size === 0 && safeSampleRows && Array.isArray(safeSampleRows) && categoryColumn) {
-                  safeSampleRows.forEach(row => {
-                    if (row && row[categoryColumn] === csvCategoryId && row[csvColumn]) {
-                      const value = String(row[csvColumn]).trim();
-                      if (value) {
-                        uniqueValues.add(value);
-                      }
-                    }
+                const value = String(csvValue).trim();
+                
+                // Check if value mapping exists (from Step 3 or Step 5)
+                const mappingKey = `${csvCategoryId}:${shareTribeFieldId}:${value}`;
+                const mappedValue = valueMappings[mappingKey];
+                const finalValue = mappedValue || value;
+                
+                // Check if final value is valid
+                const normalizedFinalValue = String(finalValue).trim();
+                const normalizedOptions = field.options.map(opt => String(opt).trim());
+                const isValid = normalizedOptions.includes(normalizedFinalValue);
+                
+                // Always include the issue if the original value is invalid, even if it's been mapped
+                // This ensures the dropdown stays visible after mapping
+                if (!normalizedOptions.includes(value.trim())) {
+                  validationIssues.push({
+                    csvColumn,
+                    shareTribeFieldId,
+                    shareTribeFieldLabel: field.label || shareTribeFieldId,
+                    csvValue: value,
+                    mappedValue: mappedValue || null,
+                    finalValue: normalizedFinalValue,
+                    allowedValues: field.options,
+                    mappingKey,
+                    isDefaultField: false,
+                    isValid: isValid // Track if the mapped value is valid
                   });
                 }
-                
-                // Validate each value
-                uniqueValues.forEach(csvValue => {
-                  // Check if value mapping exists
-                  const mappingKey = `${csvCategoryId}:${shareTribeFieldId}:${csvValue}`;
-                  const mappedValue = valueMappings[mappingKey];
-                  const finalValue = mappedValue || csvValue;
-                  
-                  // Normalize for comparison (ShareTribe enum values are case-sensitive, but we'll check both)
-                  const normalizedFinalValue = String(finalValue).trim();
-                  const normalizedOptions = field.options.map(opt => String(opt).trim());
-                  
-                  // Validate against allowed options (exact match required)
-                  if (!normalizedOptions.includes(normalizedFinalValue)) {
-                    validationIssues.push({
-                      csvCategoryId,
-                      csvCategoryName: csvCategoryId,
-                      shareTribeCategoryPath: categoryMapping?.categoryPath || csvCategoryId,
-                      csvColumn,
-                      shareTribeFieldId,
-                      shareTribeFieldLabel: field.label || shareTribeFieldId,
-                      csvValue,
-                      mappedValue,
-                      finalValue: normalizedFinalValue,
-                      allowedValues: field.options,
-                      mappingKey,
-                      isDefaultField: false
-                    });
-                  }
-                });
               });
               
-              // Find unmapped ShareTribe fields for this category
-              const mappedFieldIds = new Set([
-                ...Object.values(defaultMappings),
-                ...Object.values(categoryFieldMapping)
-              ]);
-              const unmappedFields = applicableFields.filter(field => {
-                // Skip if already mapped
-                if (mappedFieldIds.has(field.id)) return false;
-                // Skip if it's a default field (already handled in Step 1)
-                if (field.group === 'default') return false;
-                // Only show required fields or fields with enum options (user might want to set defaults)
-                return field.required || (field.options && field.options.length > 0);
+              return validationIssues;
+            };
+            
+            // Count products with unmapped required fields or unmapped validation errors
+            let productsWithUnmappedRequired = 0;
+            let productsWithValidationErrors = 0;
+            Object.keys(productsByCategory).forEach(csvCategoryId => {
+              productsByCategory[csvCategoryId].forEach(product => {
+                const unmappedFields = getUnmappedFieldsForProduct(product, csvCategoryId);
+                const validationIssues = getValidationIssuesForProduct(product, csvCategoryId);
+                if (unmappedFields.some(f => f.required)) {
+                  productsWithUnmappedRequired++;
+                }
+                // Only count products with unmapped validation errors (not mapped ones)
+                const unmappedValidationErrors = validationIssues.filter(issue => !valueMappings[issue.mappingKey]);
+                if (unmappedValidationErrors.length > 0) {
+                  productsWithValidationErrors++;
+                }
               });
-              
-              if (unmappedFields.length > 0) {
-                unmappedFieldsByCategory[csvCategoryId] = {
-                  categoryMapping,
-                  fields: unmappedFields
-                };
-              }
             });
             
             return (
               <div className="space-y-6">
                 <div className="mb-4">
-                  <h3 className="text-lg font-semibold text-gray-900 mb-2">Final Validation & Unmapped Fields</h3>
+                  <h3 className="text-lg font-semibold text-gray-900 mb-2">Final Review - Unmapped ShareTribe Fields</h3>
                   <p className="text-sm text-gray-600">
-                    Review validation issues and optionally set default values for unmapped ShareTribe fields.
+                    Review and set values for unmapped ShareTribe fields for each product. Products are grouped by category for organization.
                   </p>
                 </div>
                 
-                {/* Validation Issues Section */}
-                {validationIssues.length > 0 && (
-                  <div className="space-y-4">
-                    <h4 className="font-semibold text-red-900 mb-2">⚠️ Validation Issues ({validationIssues.length})</h4>
-                    <div className="space-y-3">
-                      {validationIssues.map((issue, idx) => {
-                        const mappingKey = issue.mappingKey;
-                        const currentMapping = valueMappings[mappingKey];
-                        
-                        return (
-                          <div key={idx} className="border border-red-200 rounded-lg p-4 bg-red-50">
-                            <div className="grid grid-cols-12 gap-4 items-center">
-                              <div className="col-span-5">
-                                <div className="space-y-1">
-                                  <div className="font-medium text-gray-900">
-                                    {issue.csvColumn} = &quot;{issue.csvValue}&quot;
-                                  </div>
-                                  <div className="text-xs text-gray-600">
-                                    Category: {issue.csvCategoryName} → {issue.shareTribeCategoryPath}
-                                  </div>
-                                  <div className="text-xs text-red-700 font-medium">
-                                    ❌ Invalid value for {issue.shareTribeFieldLabel}
-                                  </div>
-                                </div>
-                              </div>
-                              <div className="col-span-1 flex justify-center">
-                                <ArrowRight className="text-gray-400" size={20} />
-                              </div>
-                              <div className="col-span-6">
-                                <label className="block text-sm font-medium text-gray-700 mb-1">
-                                  Map to valid value:
-                                </label>
-                                <select
-                                  value={currentMapping || ''}
-                                  onChange={(e) => {
-                                    const newMappings = { ...valueMappings };
-                                    if (e.target.value) {
-                                      newMappings[mappingKey] = e.target.value;
-                                    } else {
-                                      delete newMappings[mappingKey];
-                                    }
-                                    setValueMappings(newMappings);
-                                  }}
-                                  className="w-full px-3 py-2 border border-red-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent bg-white"
-                                >
-                                  <option value="">Select a valid value...</option>
-                                  {issue.allowedValues.map((allowedValue, valIdx) => (
-                                    <option key={valIdx} value={allowedValue}>
-                                      &quot;{allowedValue}&quot;
-                                    </option>
-                                  ))}
-                                </select>
-                                {currentMapping && (
-                                  <div className="mt-1 text-xs text-green-700 bg-green-50 border border-green-200 rounded p-2">
-                                    ✅ Mapped: &quot;{issue.csvValue}&quot; → &quot;{currentMapping}&quot;
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      })}
+                {/* Warning for products with unmapped required fields or validation errors */}
+                {(productsWithUnmappedRequired > 0 || productsWithValidationErrors > 0) && (
+                  <div className="bg-yellow-50 border-2 border-yellow-400 rounded-lg p-4">
+                    <div className="flex items-start">
+                      <AlertCircle className="text-yellow-600 mr-2 mt-0.5" size={20} />
+                      <div>
+                        <h4 className="font-semibold text-yellow-900 mb-1">
+                          ⚠️ Warning: Issues Found
+                        </h4>
+                        <p className="text-sm text-yellow-800">
+                          {productsWithUnmappedRequired > 0 && (
+                            <span>{productsWithUnmappedRequired} product{productsWithUnmappedRequired !== 1 ? 's' : ''} with unmapped required fields. </span>
+                          )}
+                          {productsWithValidationErrors > 0 && (
+                            <span>{productsWithValidationErrors} product{productsWithValidationErrors !== 1 ? 's' : ''} with invalid field values. </span>
+                          )}
+                          Please review and fix them before continuing.
+                        </p>
+                      </div>
                     </div>
                   </div>
                 )}
                 
-                {/* Unmapped Fields Section */}
-                {Object.keys(unmappedFieldsByCategory).length > 0 && (() => {
-                  // Count required unmapped fields
-                  const requiredUnmappedCount = Object.values(unmappedFieldsByCategory).reduce((sum, cat) => 
-                    sum + cat.fields.filter(f => f.required).length, 0
-                  );
-                  const hasRequiredUnmapped = requiredUnmappedCount > 0;
-                  
-                  return (
-                    <div className="space-y-4">
-                      {hasRequiredUnmapped && (
-                        <div className="bg-yellow-50 border-2 border-yellow-400 rounded-lg p-4">
-                          <div className="flex items-start">
-                            <AlertCircle className="text-yellow-600 mr-2 mt-0.5" size={20} />
-                            <div>
-                              <h4 className="font-semibold text-yellow-900 mb-1">
-                                ⚠️ Warning: {requiredUnmappedCount} Required ShareTribe Field{requiredUnmappedCount !== 1 ? 's' : ''} Unmapped
-                              </h4>
-                              <p className="text-sm text-yellow-800">
-                                Some required ShareTribe fields are not mapped. Unmapped eBay/CSV fields are okay, but unmapped required ShareTribe fields may cause issues. Please review and map them before continuing.
+                {/* Products grouped by category */}
+                <div className="space-y-4">
+                  {Object.keys(productsByCategory).map(csvCategoryId => {
+                    const categoryMapping = categoryShareTribeMappings[csvCategoryId];
+                    const shareTribeCategoryId = categoryMapping?.categoryId;
+                    const isExpanded = expandedCategories[csvCategoryId] !== false; // Default to expanded
+                    const products = productsByCategory[csvCategoryId];
+                    const applicableFields = shareTribeCategoryId ? getFieldsForCategory(shareTribeCategoryId) : [];
+                    
+                    return (
+                      <div key={csvCategoryId} className="border border-gray-300 rounded-lg overflow-hidden">
+                        {/* Category Header */}
+                        <button
+                          onClick={() => toggleCategoryExpansion(csvCategoryId)}
+                          className="w-full px-4 py-3 bg-gray-50 hover:bg-gray-100 flex items-center justify-between text-left"
+                        >
+                          <div>
+                            <h4 className="font-semibold text-gray-900">
+                              {csvCategoryId}
+                            </h4>
+                            {categoryMapping && (
+                              <p className="text-sm text-gray-600">
+                                ShareTribe: {categoryMapping.categoryPath} • {products.length} product{products.length !== 1 ? 's' : ''}
                               </p>
-                            </div>
+                            )}
                           </div>
-                        </div>
-                      )}
-                      <h4 className={`font-semibold mb-2 ${hasRequiredUnmapped ? 'text-yellow-900' : 'text-blue-900'}`}>
-                        ℹ️ Unmapped ShareTribe Fields ({Object.values(unmappedFieldsByCategory).reduce((sum, cat) => sum + cat.fields.length, 0)})
-                      </h4>
-                      <p className="text-sm text-gray-600">
-                        These ShareTribe fields are available for this category but haven&apos;t been mapped. You can optionally set default values for them.
-                      </p>
-                    <div className="space-y-4">
-                      {Object.keys(unmappedFieldsByCategory).map(csvCategoryId => {
-                        const { categoryMapping, fields } = unmappedFieldsByCategory[csvCategoryId];
+                          {isExpanded ? <ChevronUp size={20} /> : <ChevronDown size={20} />}
+                        </button>
                         
-                        return (
-                          <div key={csvCategoryId} className="border border-blue-200 rounded-lg p-4 bg-blue-50">
-                            <div className="mb-3">
-                              <h5 className="font-semibold text-gray-900">Category: {csvCategoryId}</h5>
-                              {categoryMapping && (
-                                <p className="text-sm text-gray-600">
-                                  ShareTribe: {categoryMapping.categoryPath}
-                                </p>
-                              )}
-                            </div>
-                            <div className="space-y-3">
-                              {fields.map(field => {
-                                const fieldKey = `${csvCategoryId}:${field.id}`;
-                                const currentValue = unmappedFieldValues[fieldKey];
-                                
-                                return (
-                                  <div key={field.id} className="bg-white rounded-lg p-3 border border-blue-200">
-                                    <div className="flex items-start justify-between mb-2">
-                                      <div>
-                                        <label className="font-medium text-gray-900">
-                                          {field.label} {field.required && <span className="text-red-600">*</span>}
-                                        </label>
-                                        {field.options && field.options.length > 0 && (
-                                          <div className="text-xs text-gray-600 mt-1">
-                                            Type: {field.type} | Options: {field.options.slice(0, 5).join(', ')}{field.options.length > 5 ? '...' : ''}
-                                          </div>
-                                        )}
-                                      </div>
-                                    </div>
-                                    {field.options && Array.isArray(field.options) && field.options.length > 0 ? (
-                                      <select
-                                        value={currentValue || ''}
-                                        onChange={(e) => {
-                                          const newValues = { ...unmappedFieldValues };
-                                          if (e.target.value) {
-                                            newValues[fieldKey] = e.target.value;
-                                          } else {
-                                            delete newValues[fieldKey];
-                                          }
-                                          setUnmappedFieldValues(newValues);
-                                        }}
-                                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                                      >
-                                        <option value="">No default value</option>
-                                        {field.options.map((option, optIdx) => (
-                                          <option key={optIdx} value={option}>
-                                            {option}
-                                          </option>
-                                        ))}
-                                      </select>
-                                    ) : (
-                                      <input
-                                        type="text"
-                                        value={currentValue || ''}
-                                        onChange={(e) => {
-                                          const newValues = { ...unmappedFieldValues };
-                                          if (e.target.value) {
-                                            newValues[fieldKey] = e.target.value;
-                                          } else {
-                                            delete newValues[fieldKey];
-                                          }
-                                          setUnmappedFieldValues(newValues);
-                                        }}
-                                        placeholder={field.required ? 'Required - enter a value' : 'Optional - enter a default value'}
-                                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        {/* Products in this category */}
+                        {isExpanded && (
+                          <div className="p-4 space-y-6 bg-white">
+                            {products.map((product, productIdx) => {
+                              const productId = product.productId;
+                              const unmappedFields = getUnmappedFieldsForProduct(product, csvCategoryId);
+                              const validationIssues = getValidationIssuesForProduct(product, csvCategoryId);
+                              const hasUnmappedRequired = unmappedFields.some(f => f.required);
+                              // Only show error badge if there are unmapped validation errors
+                              const unmappedValidationErrors = validationIssues.filter(issue => !valueMappings[issue.mappingKey]);
+                              const hasValidationErrors = unmappedValidationErrors.length > 0;
+                              
+                              return (
+                                <div 
+                                  key={`${productId}-${productIdx}`} 
+                                  className={`border rounded-lg p-4 ${
+                                    hasUnmappedRequired || hasValidationErrors 
+                                      ? 'border-yellow-300 bg-yellow-50' 
+                                      : 'border-gray-200 bg-gray-50'
+                                  }`}
+                                >
+                                  {/* Product Header */}
+                                  <div className="flex items-start mb-4">
+                                    {product.row.images && (
+                                      <img
+                                        src={product.row.images.split(',')[0]}
+                                        alt={product.row.title || 'Product'}
+                                        className="h-16 w-16 object-cover rounded mr-3"
+                                        onError={(e) => { e.target.style.display = 'none'; }}
                                       />
                                     )}
-                                    {currentValue && (
-                                      <div className="mt-1 text-xs text-green-700">
-                                        ✓ Default value set: &quot;{currentValue}&quot;
-                                      </div>
-                                    )}
+                                    <div className="flex-1">
+                                      <h5 className="font-semibold text-gray-900 mb-1">
+                                        {product.row.title || 'Untitled Product'}
+                                      </h5>
+                                      <p className="text-xs text-gray-500">
+                                        ID: {productId} {product.row.sku && `• SKU: ${product.row.sku}`}
+                                      </p>
+                                      {hasUnmappedRequired && (
+                                        <span className="inline-block mt-1 px-2 py-0.5 bg-yellow-200 text-yellow-800 text-xs rounded mr-2">
+                                          ⚠️ Has unmapped required fields
+                  </span>
+                                      )}
+                                      {hasValidationErrors && (
+                                        <span className="inline-block mt-1 px-2 py-0.5 bg-red-200 text-red-800 text-xs rounded">
+                                          ❌ Has invalid field values ({validationIssues.length})
+                                        </span>
+                                      )}
+                                    </div>
                                   </div>
-                                );
-                              })}
-                            </div>
+                                  
+                                  {/* Validation Issues */}
+                                  {validationIssues.length > 0 && (
+                                    <div className="mb-4">
+                                      <h6 className="text-sm font-medium text-red-900 mb-2">
+                                        Validation Errors ({validationIssues.length})
+                                      </h6>
+                                      <div className="space-y-2">
+                                        {validationIssues.map((issue, issueIdx) => {
+                                          const currentMapping = valueMappings[issue.mappingKey];
+                                          const isMapped = !!currentMapping;
+                                          
+                                          return (
+                                            <div 
+                                              key={issueIdx} 
+                                              className={`bg-white rounded p-2 border ${
+                                                isMapped ? 'border-green-300' : 'border-red-300'
+                                              }`}
+                                            >
+                                              <div className="grid grid-cols-12 gap-2 items-center">
+                                                <div className="col-span-5">
+                                                  <div className="text-sm font-medium text-gray-900">
+                                                    {issue.csvColumn} = &quot;{issue.csvValue}&quot;
+                                                  </div>
+                                                  {!isMapped ? (
+                                                    <div className="text-xs text-red-700 font-medium mt-0.5">
+                                                      ❌ Invalid value for {issue.shareTribeFieldLabel}
+                                                    </div>
+                                                  ) : (
+                                                    <div className="text-xs text-green-700 font-medium mt-0.5">
+                                                      ✓ Value mapped for {issue.shareTribeFieldLabel}
+                                                    </div>
+                                                  )}
+                                                </div>
+                                                <div className="col-span-1 flex justify-center">
+                                                  <ArrowRight className="text-gray-400" size={16} />
+                                                </div>
+                                                <div className="col-span-6">
+                                                  <select
+                                                    value={currentMapping || ''}
+                                                    onChange={(e) => {
+                                                      const newMappings = { ...valueMappings };
+                                                      if (e.target.value) {
+                                                        newMappings[issue.mappingKey] = e.target.value;
+                                                      } else {
+                                                        delete newMappings[issue.mappingKey];
+                                                      }
+                                                      setValueMappings(newMappings);
+                                                    }}
+                                                    className={`w-full px-2 py-1.5 text-sm border rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white ${
+                                                      isMapped ? 'border-green-300' : 'border-red-300'
+                                                    }`}
+                                                  >
+                                                    <option value="">Select a valid value...</option>
+                                                    {issue.allowedValues.map((allowedValue, valIdx) => (
+                                                      <option key={valIdx} value={allowedValue}>
+                                                        &quot;{allowedValue}&quot;
+                                                      </option>
+                                                    ))}
+                                                  </select>
+                                                  {currentMapping && (
+                                                    <div className="mt-1 text-xs text-green-700 bg-green-50 border border-green-200 rounded p-1">
+                                                      ✓ Value set: &quot;{currentMapping}&quot;
+                                                    </div>
+                                                  )}
+                                                </div>
+                                              </div>
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    </div>
+                                  )}
+                                  
+                                  {/* Unmapped ShareTribe Fields */}
+                                  {unmappedFields.length > 0 ? (
+                                    <div>
+                                      <h6 className={`text-sm font-medium mb-2 ${hasUnmappedRequired ? 'text-yellow-900' : 'text-gray-700'}`}>
+                                        Unmapped ShareTribe Fields ({unmappedFields.length})
+                                      </h6>
+                                      <div className="space-y-2">
+                                        {unmappedFields.map(field => {
+                                          const valueKey = `${productId}:${field.id}`;
+                                          const currentValue = productUnmappedFieldValues[valueKey];
+                                          
+                                          return (
+                                            <div key={field.id} className={`bg-white rounded p-2 border ${field.required ? 'border-yellow-300' : 'border-gray-200'}`}>
+                                              <label className="text-sm font-medium text-gray-900 block mb-1">
+                                                {field.label} {field.required && <span className="text-red-600">*</span>}
+                                              </label>
+                                              {field.options && Array.isArray(field.options) && field.options.length > 0 ? (
+                                                <select
+                                                  value={currentValue || ''}
+                                                  onChange={(e) => handleProductUnmappedFieldValue(productId, field.id, e.target.value)}
+                                                  className={`w-full px-2 py-1.5 text-sm border rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent ${field.required && !currentValue ? 'border-yellow-300' : 'border-gray-300'}`}
+                                                >
+                                                  <option value="">{field.required ? 'Required - select a value' : 'No value'}</option>
+                                                  {field.options.map((option, optIdx) => (
+                                                    <option key={optIdx} value={option}>
+                                                      {option}
+                                                    </option>
+                                                  ))}
+                                                </select>
+                                              ) : (
+                                                <input
+                                                  type="text"
+                                                  value={currentValue || ''}
+                                                  onChange={(e) => handleProductUnmappedFieldValue(productId, field.id, e.target.value)}
+                                                  placeholder={field.required ? 'Required - enter a value' : 'Optional - enter a value'}
+                                                  className={`w-full px-2 py-1.5 text-sm border rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent ${field.required && !currentValue ? 'border-yellow-300' : 'border-gray-300'}`}
+                                                />
+                                              )}
+                                              {currentValue && (
+                                                <div className="mt-1 text-xs text-green-700">
+                                                  ✓ Value set: &quot;{currentValue}&quot;
+                                                </div>
+                                              )}
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    </div>
+                                  ) : (
+                                    <div className="text-center py-2 text-sm text-green-700 bg-green-50 rounded border border-green-200">
+                                      ✓ All ShareTribe fields mapped
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
                           </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                  );
-                })()}
-                
-                {/* Success Message */}
-                {validationIssues.length === 0 && Object.keys(unmappedFieldsByCategory).length === 0 && (
-                  <div className="bg-green-50 border border-green-200 rounded-lg p-6 text-center">
-                    <CheckCircle className="text-green-600 mx-auto mb-2" size={32} />
-                    <h4 className="font-semibold text-green-900 mb-1">All validations passed!</h4>
-                    <p className="text-sm text-green-800">
-                      All mapped values are valid and there are no unmapped required fields. You can proceed to import.
-                    </p>
-                  </div>
-                )}
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             );
           })()}
@@ -1800,12 +1901,12 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
           </button>
           
           <div className="flex space-x-3">
-            <button
-              onClick={onCancel}
-              className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
-            >
-              Cancel
-            </button>
+          <button
+            onClick={onCancel}
+            className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
+          >
+            Cancel
+          </button>
             {step < 5 ? (
               <button
                 onClick={handleNext}
@@ -1816,15 +1917,15 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
                 <ChevronRight size={18} />
               </button>
             ) : (
-              <button
-                onClick={handleConfirm}
+          <button
+            onClick={handleConfirm}
                 disabled={!isValidStep1 || hasUnmappedRequiredFields}
-                className="flex items-center space-x-2 px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex items-center space-x-2 px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
                 title={hasUnmappedRequiredFields ? 'Please map all required ShareTribe fields before importing' : ''}
-              >
-                <Check size={18} />
-                <span>Import Products</span>
-              </button>
+          >
+            <Check size={18} />
+            <span>Import Products</span>
+          </button>
             )}
           </div>
         </div>
