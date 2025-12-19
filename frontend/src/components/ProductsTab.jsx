@@ -623,13 +623,13 @@ const ProductsTab = () => {
             <tbody className="bg-white divide-y divide-gray-200">
               {loading ? (
                 <tr>
-                  <td colSpan="7" className="px-6 py-4 text-center text-gray-500">
+                  <td colSpan="6" className="px-6 py-4 text-center text-gray-500">
                     Loading...
                   </td>
                 </tr>
               ) : filteredProducts.length === 0 ? (
                 <tr>
-                  <td colSpan="7" className="px-6 py-4 text-center text-gray-500">
+                  <td colSpan="6" className="px-6 py-4 text-center text-gray-500">
                     No products found
                   </td>
                 </tr>
@@ -662,40 +662,8 @@ const ProductsTab = () => {
                         </div>
                       </div>
                     </td>
-                    <td className="px-6 py-4 text-sm text-gray-900">
-                      <div className="flex flex-col">
-                        <span className="font-mono text-xs">{product.ebay_item_id || 'N/A'}</span>
-                        {product.listing_url && (
-                          <a 
-                            href={product.listing_url} 
-                            target="_blank" 
-                            rel="noopener noreferrer"
-                            className="text-blue-600 hover:underline text-xs mt-1"
-                          >
-                            View on eBay →
-                          </a>
-                        )}
-                      </div>
-                    </td>
-                    <td className="px-6 py-4 text-sm text-gray-900">
-                      <div className="flex flex-col">
-                        <span className="font-medium">
-                          {product.price ? `${product.currency || 'USD'} ${product.price.toFixed(2)}` : 'N/A'}
-                        </span>
-                        {product.listing_type && (
-                          <div className="text-xs text-gray-500 mt-1 space-y-0.5">
-                            <div>Type: {product.listing_type}</div>
-                            {product.price_source && (
-                              <div>Source: {product.price_source}</div>
-                            )}
-                            {product.price_raw_xml && (
-                              <div className="font-mono text-xs mt-1 break-all" title="Raw XML">
-                                XML: {product.price_raw_xml.substring(0, 100)}...
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </div>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                      {product.price ? `${product.currency || 'GBP'} ${product.price.toFixed(2)}` : 'N/A'}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
                       {product.quantity || 0}
