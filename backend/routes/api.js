@@ -744,7 +744,7 @@ router.post('/products/upload-csv', upload.single('csvFile'), async (req, res) =
   try {
     const tenantId = getTenantId(req);
     const filePath = req.file.path;
-    const { columnMappings, categoryMappings, categoryColumn, categoryFieldMappings, categoryListingTypeMappings, valueMappings, unmappedFieldValues } = req.body;
+    const { columnMappings, categoryMappings, categoryColumn, categoryFieldMappings, categoryListingTypeMappings, valueMappings, unmappedFieldValues, productFieldMappings, productUnmappedFieldValues } = req.body;
     
     // Parse column mappings from JSON string if needed
     let mappings = columnMappings;
@@ -812,6 +812,25 @@ router.post('/products/upload-csv', upload.single('csvFile'), async (req, res) =
       }
     }
     
+    // Parse product-level mappings
+    let productFieldMaps = productFieldMappings || {};
+    if (typeof productFieldMappings === 'string') {
+      try {
+        productFieldMaps = JSON.parse(productFieldMappings);
+      } catch (e) {
+        productFieldMaps = {};
+      }
+    }
+    
+    let productUnmappedVals = productUnmappedFieldValues || {};
+    if (typeof productUnmappedFieldValues === 'string') {
+      try {
+        productUnmappedVals = JSON.parse(productUnmappedFieldValues);
+      } catch (e) {
+        productUnmappedVals = {};
+      }
+    }
+    
     console.log('Received column mappings:', JSON.stringify(mappings, null, 2));
     console.log('Received category mappings:', JSON.stringify(catMappings, null, 2));
     console.log('Received category column:', categoryColumn);
@@ -819,6 +838,8 @@ router.post('/products/upload-csv', upload.single('csvFile'), async (req, res) =
     console.log('Received category listing type mappings:', JSON.stringify(catListingTypeMappings, null, 2));
     console.log('Received value mappings:', JSON.stringify(valMappings, null, 2));
     console.log('Received unmapped field values:', JSON.stringify(unmappedValues, null, 2));
+    console.log('Received product field mappings:', JSON.stringify(productFieldMaps, null, 2));
+    console.log('Received product unmapped field values:', JSON.stringify(productUnmappedVals, null, 2));
     
     // Parse CSV file with custom column mappings and per-category mappings
     // Get default currency from ShareTribe marketplace config
@@ -836,7 +857,7 @@ router.post('/products/upload-csv', upload.single('csvFile'), async (req, res) =
       console.warn('Could not fetch marketplace default currency:', error.message);
     }
 
-    const products = await csvService.parseCSVWithMappings(filePath, mappings, catMappings, categoryColumn, catFieldMappings, defaultCurrency, valMappings, catListingTypeMappings, unmappedValues);
+    const products = await csvService.parseCSVWithMappings(filePath, mappings, catMappings, categoryColumn, catFieldMappings, defaultCurrency, valMappings, catListingTypeMappings, unmappedValues, productFieldMaps, productUnmappedVals);
     
     // Store products in database (mark as not synced yet)
     const dbInstance = db.getDb();
@@ -1024,7 +1045,9 @@ router.post('/products/apply-ebay-mappings', async (req, res) => {
           defaultCurrency,
           valueMappings,
           categoryListingTypeMappings,
-          unmappedFieldValues
+          unmappedFieldValues,
+          productFieldMappings,
+          productUnmappedFieldValues
         );
 
         if (!mappedProduct || !mappedProduct.ebay_item_id) {

@@ -150,9 +150,13 @@ class CSVService {
    * @param {string} categoryColumn - CSV column name that contains category IDs
    * @param {Object} categoryFieldMappings - Object mapping category IDs to their field mappings
    *   Example: { 'Helmets': { 'Size': 'size', 'Color': 'color' } }
+   * @param {Object} productFieldMappings - Object mapping product IDs to their field mappings (product-level, takes precedence)
+   *   Example: { '205917057893:brand': 'gearbrand', '205917057893:size': 'helmetsize' }
+   * @param {Object} productUnmappedFieldValues - Object mapping product IDs to unmapped field values
+   *   Example: { '205917057893:gearbrand': 'Fox Racing' }
    * @returns {Promise<Array>} Array of product objects
    */
-  async parseCSVWithMappings(filePath, columnMappings, categoryMappings = {}, categoryColumn = null, categoryFieldMappings = {}, defaultCurrency = null, valueMappings = {}, categoryListingTypeMappings = {}, unmappedFieldValues = {}) {
+  async parseCSVWithMappings(filePath, columnMappings, categoryMappings = {}, categoryColumn = null, categoryFieldMappings = {}, defaultCurrency = null, valueMappings = {}, categoryListingTypeMappings = {}, unmappedFieldValues = {}, productFieldMappings = {}, productUnmappedFieldValues = {}) {
     return new Promise((resolve, reject) => {
       const results = [];
       let rowCount = 0;
@@ -230,7 +234,7 @@ class CSVService {
   /**
    * Map CSV row using custom column mappings and category mappings
    */
-  mapCSVRowWithMappings(row, columnMappings, categoryMappings = {}, categoryColumn = null, categoryFieldMappings = {}, itemIdColumn = null, defaultCurrency = null, valueMappings = {}, categoryListingTypeMappings = {}, unmappedFieldValues = {}) {
+  mapCSVRowWithMappings(row, columnMappings, categoryMappings = {}, categoryColumn = null, categoryFieldMappings = {}, itemIdColumn = null, defaultCurrency = null, valueMappings = {}, categoryListingTypeMappings = {}, unmappedFieldValues = {}, productFieldMappings = {}, productUnmappedFieldValues = {}) {
     const product = {};
     
     // Get all available CSV column names (for debugging)
@@ -413,18 +417,98 @@ class CSVService {
       console.log(`Using default listing type "list-new-item" for category "${csvCategoryId}"`);
     }
     
+    // Get product ID for product-level mappings
+    let productId = null;
+    if (itemIdColumn && row[itemIdColumn]) {
+      productId = row[itemIdColumn].toString().trim();
+    } else if (product.ebay_item_id) {
+      productId = product.ebay_item_id.toString().trim();
+    }
+    
+    // Apply product-level field mappings (takes precedence over category-level mappings)
+    // Format: "productId:csvColumn" -> "shareTribeFieldId"
+    if (productId && Object.keys(productFieldMappings).length > 0) {
+      Object.keys(productFieldMappings).forEach(mappingKey => {
+        // Format: "productId:csvColumn"
+        const [mappedProductId, csvColumn] = mappingKey.split(':');
+        if (mappedProductId === productId && csvColumn) {
+          const targetField = productFieldMappings[mappingKey];
+          if (!targetField || targetField.trim() === '') return;
+          
+          let value = row[csvColumn];
+          if (value === undefined || value === null || value.toString().trim() === '') {
+            // Try normalized versions
+            const normalizedRow = {};
+            for (const key in row) {
+              normalizedRow[key] = row[key];
+              normalizedRow[key.trim()] = row[key];
+              normalizedRow[key.toLowerCase().trim()] = row[key];
+            }
+            value = normalizedRow[csvColumn.trim()] || normalizedRow[csvColumn.toLowerCase().trim()];
+          }
+          
+          if (value !== undefined && value !== null && value.toString().trim() !== '') {
+            let finalValue = value.toString().trim();
+            
+            // Apply value mapping if exists
+            const valueMappingKey = `${csvCategoryId}:${targetField}:${finalValue}`;
+            if (valueMappings[valueMappingKey]) {
+              finalValue = valueMappings[valueMappingKey];
+              console.log(`Applied value mapping for product "${productId}": "${value}" -> "${finalValue}" (field: ${targetField})`);
+            }
+            
+            // Handle special field types
+            if (targetField === 'price') {
+              product[targetField] = parseFloat(finalValue) || 0;
+            } else if (targetField === 'price.amount') {
+              product.price = parseFloat(finalValue) || 0;
+              product.currency = defaultCurrency || null;
+            } else if (targetField === 'quantity') {
+              product[targetField] = parseInt(finalValue) || 0;
+            } else if (targetField === 'images') {
+              const images = finalValue.split(',').map(img => img.trim()).filter(img => img);
+              product[targetField] = images.join(',');
+            } else {
+              product[targetField] = finalValue;
+            }
+            
+            console.log(`Applied product-level mapping for product "${productId}": ${csvColumn} -> ${targetField} = "${finalValue}"`);
+          }
+        }
+      });
+    }
+    
     // Apply unmapped field values (default values for unmapped ShareTribe fields)
-    // Format: "categoryId:fieldId" -> "defaultValue"
+    // First try product-level, then category-level
+    // Product-level format: "productId:fieldId" -> "defaultValue"
+    // Category-level format: "categoryId:fieldId" -> "defaultValue"
+    if (productId && Object.keys(productUnmappedFieldValues).length > 0) {
+      Object.keys(productUnmappedFieldValues).forEach(valueKey => {
+        // Format: "productId:fieldId"
+        const [mappedProductId, fieldId] = valueKey.split(':');
+        if (mappedProductId === productId && fieldId) {
+          const defaultValue = productUnmappedFieldValues[valueKey];
+          if (defaultValue && String(defaultValue).trim() !== '') {
+            product[fieldId] = String(defaultValue).trim();
+            console.log(`Applied product-level unmapped field value for product "${productId}": ${fieldId} = "${defaultValue}"`);
+          }
+        }
+      });
+    }
+    
+    // Apply category-level unmapped field values (only if not set by product-level)
     if (csvCategoryId && Object.keys(unmappedFieldValues).length > 0) {
       Object.keys(unmappedFieldValues).forEach(fieldKey => {
-        // Check if this field key matches the current category
         // Format: "categoryId:fieldId"
         const [categoryId, fieldId] = fieldKey.split(':');
         if (categoryId === csvCategoryId && fieldId) {
-          const defaultValue = unmappedFieldValues[fieldKey];
-          if (defaultValue && defaultValue.trim() !== '') {
-            product[fieldId] = defaultValue;
-            console.log(`Applied unmapped field value for category "${csvCategoryId}": ${fieldId} = "${defaultValue}"`);
+          // Only apply if product-level didn't already set this field
+          if (product[fieldId] === undefined || product[fieldId] === null || product[fieldId] === '') {
+            const defaultValue = unmappedFieldValues[fieldKey];
+            if (defaultValue && String(defaultValue).trim() !== '') {
+              product[fieldId] = String(defaultValue).trim();
+              console.log(`Applied category-level unmapped field value for category "${csvCategoryId}": ${fieldId} = "${defaultValue}"`);
+            }
           }
         }
       });
