@@ -11,17 +11,40 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
     csvPreview: !!csvPreview,
     csvPreviewColumns: csvPreview?.columns?.length,
     csvPreviewSampleRows: csvPreview?.sampleRows?.length,
+    csvPreviewRowCount: csvPreview?.rowCount,
+    hasCategorySamples: !!csvPreview?.categorySamples,
+    categorySamplesColumns: csvPreview?.categorySamples ? Object.keys(csvPreview.categorySamples) : [],
+    titleColumn: csvPreview?.titleColumn,
     isEbayProducts
   });
   
   // Early validation - ensure we have required props
   const safeCsvColumns = csvColumns || csvPreview?.columns || [];
-  const safeSampleRows = sampleRows || csvPreview?.sampleRows || [];
+  
+  // Prioritize csvPreview.sampleRows if it has more rows (backend sends up to 1000)
+  // This ensures we can find sample products for categories that appear later in the file
+  const safeSampleRows = (() => {
+    const previewRows = csvPreview?.sampleRows || [];
+    const propRows = sampleRows || [];
+    // Use whichever has more rows (preview should have up to 1000, prop might be limited)
+    return previewRows.length >= propRows.length ? previewRows : propRows;
+  })();
+  
+  // For finding sample products per category, use ALL rows if available
+  // For eBay products, we might have all products passed separately
+  // For CSV, we use all available sample rows (which might be limited, but we scan through all of them)
+  const allRowsForCategorySearch = safeSampleRows; // Use all available rows
   
   console.log('CSVColumnMapping: Safe props:', {
     safeCsvColumns: safeCsvColumns?.length,
     safeSampleRows: safeSampleRows?.length,
-    isArray: Array.isArray(safeCsvColumns)
+    allRowsForCategorySearch: allRowsForCategorySearch?.length,
+    isArray: Array.isArray(safeCsvColumns),
+    // Detailed row source info
+    propSampleRows: sampleRows?.length,
+    csvPreviewSampleRows: csvPreview?.sampleRows?.length,
+    csvPreviewRowCount: csvPreview?.rowCount,
+    whichSourceUsed: csvPreview?.sampleRows?.length >= (sampleRows?.length || 0) ? 'csvPreview' : 'prop'
   });
   
   if (!Array.isArray(safeCsvColumns) || safeCsvColumns.length === 0) {
@@ -140,16 +163,30 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
     if (!safeSampleRows || !Array.isArray(safeSampleRows) || safeSampleRows.length === 0) return [];
     
     const categories = new Set();
+    const categoryCounts = {};
+    
     safeSampleRows.forEach(row => {
-      if (row && row[categoryColumn]) {
+      if (row && row[categoryColumn] !== null && row[categoryColumn] !== undefined) {
         const categoryValue = row[categoryColumn];
-        if (categoryValue && categoryValue.toString().trim() !== '') {
-          categories.add(categoryValue.toString().trim());
+        // Normalize the category value (same way we'll compare later)
+        const normalizedCategory = String(categoryValue).trim();
+        if (normalizedCategory !== '') {
+          categories.add(normalizedCategory);
+          categoryCounts[normalizedCategory] = (categoryCounts[normalizedCategory] || 0) + 1;
         }
       }
     });
     
-    return Array.from(categories).sort();
+    const sortedCategories = Array.from(categories).sort();
+    console.log('uniqueCategories: Extracted categories', {
+      categoryColumn,
+      totalRows: safeSampleRows.length,
+      uniqueCategoriesCount: sortedCategories.length,
+      sampleCategories: sortedCategories.slice(0, 5),
+      categoryCounts: Object.entries(categoryCounts).slice(0, 10)
+    });
+    
+    return sortedCategories;
   }, [categoryColumn, safeSampleRows, csvPreview]);
 
   // Get unique category IDs from CSV (wrapper function)
@@ -157,19 +194,269 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
     return uniqueCategories;
   }, [uniqueCategories]);
 
+  // Pre-compute sample products for each category
+  // Priority: Use backend's categorySamples (scanned ALL rows) if available, otherwise scan frontend rows
+  const categorySampleProducts = useMemo(() => {
+    // Log what we have available
+    console.log('categorySampleProducts: useMemo triggered', {
+      categoryColumn,
+      hasCsvPreview: !!csvPreview,
+      hasCategorySamples: !!csvPreview?.categorySamples,
+      csvPreviewType: typeof csvPreview,
+      csvPreviewKeys: csvPreview ? Object.keys(csvPreview) : [],
+      availableColumns: csvPreview?.categorySamples ? Object.keys(csvPreview.categorySamples) : [],
+      rowCount: csvPreview?.rowCount,
+      allRowsForCategorySearchLength: allRowsForCategorySearch?.length
+    });
+    
+    if (!categoryColumn) {
+      console.log('categorySampleProducts: No categoryColumn set yet, returning empty');
+      return {};
+    }
+    
+    // Strategy 1: Use backend's pre-computed categorySamples (scanned ALL rows in CSV)
+    console.log('categorySampleProducts: Checking backend categorySamples', {
+      hasCsvPreview: !!csvPreview,
+      hasCategorySamples: !!csvPreview?.categorySamples,
+      categoryColumn,
+      availableColumns: csvPreview?.categorySamples ? Object.keys(csvPreview.categorySamples) : [],
+      rowCount: csvPreview?.rowCount,
+      // Log the actual categorySamples structure
+      categorySamplesStructure: csvPreview?.categorySamples ? 
+        Object.keys(csvPreview.categorySamples).reduce((acc, col) => {
+          acc[col] = Object.keys(csvPreview.categorySamples[col]).length + ' categories';
+          return acc;
+        }, {}) : null
+    });
+    
+    if (csvPreview?.categorySamples) {
+      // Try exact match first
+      let backendSamples = csvPreview.categorySamples[categoryColumn];
+      
+      // If no exact match, try case-insensitive match
+      if (!backendSamples && categoryColumn) {
+        const availableColumns = Object.keys(csvPreview.categorySamples);
+        const matchedColumn = availableColumns.find(col => 
+          col.toLowerCase() === categoryColumn.toLowerCase() || 
+          col.trim().toLowerCase() === categoryColumn.trim().toLowerCase()
+        );
+        if (matchedColumn) {
+          console.log(`categorySampleProducts: Found case-insensitive match: "${categoryColumn}" -> "${matchedColumn}"`);
+          backendSamples = csvPreview.categorySamples[matchedColumn];
+        }
+      }
+      
+      // Try to find a close match if exact match failed
+      if (!backendSamples) {
+        console.error('❌ categorySampleProducts: categoryColumn not found in backend categorySamples!', {
+          categoryColumn,
+          categoryColumnType: typeof categoryColumn,
+          availableColumns: Object.keys(csvPreview.categorySamples),
+          availableColumnsLowercase: Object.keys(csvPreview.categorySamples).map(c => c.toLowerCase()),
+          categoryColumnLowercase: categoryColumn?.toLowerCase(),
+          // Try to find a close match
+          closeMatches: Object.keys(csvPreview.categorySamples).filter(col => 
+            col.toLowerCase().includes(categoryColumn.toLowerCase()) || 
+            categoryColumn.toLowerCase().includes(col.toLowerCase())
+          )
+        });
+        // Try to use a close match
+        const availableColumns = Object.keys(csvPreview.categorySamples);
+        const closeMatch = availableColumns.find(col => 
+          col.toLowerCase().includes(categoryColumn.toLowerCase()) || 
+          categoryColumn.toLowerCase().includes(col.toLowerCase())
+        );
+        if (closeMatch) {
+          console.warn(`⚠️ Using close match: "${categoryColumn}" -> "${closeMatch}"`);
+          backendSamples = csvPreview.categorySamples[closeMatch];
+        }
+      }
+      
+      // If we found backendSamples (either exact or close match), use them
+      if (backendSamples) {
+        const samplesByCategory = {};
+        
+        console.log('categorySampleProducts: Backend samples for column', {
+          categoryColumn,
+          backendSamplesKeys: Object.keys(backendSamples),
+          backendSamplesCount: Object.keys(backendSamples).length,
+          firstFewSamples: Object.entries(backendSamples).slice(0, 5)
+        });
+        
+        // Convert backend format to frontend format
+        Object.keys(backendSamples).forEach(categoryValue => {
+          const normalizedCategory = String(categoryValue).trim();
+          if (normalizedCategory && backendSamples[categoryValue] && Array.isArray(backendSamples[categoryValue])) {
+            samplesByCategory[normalizedCategory] = backendSamples[categoryValue];
+          }
+        });
+        
+        console.log('✅ categorySampleProducts: Using backend pre-computed samples (scanned ALL rows)', {
+          categoryColumn,
+          totalRowsScanned: csvPreview.rowCount || 'unknown',
+          categoriesWithSamples: Object.keys(samplesByCategory).length,
+          titleColumn: csvPreview.titleColumn || 'unknown',
+          allCategorySamples: Object.entries(samplesByCategory).map(([cat, titles]) => ({ 
+            category: cat, 
+            titles: titles.length,
+            sampleTitles: titles 
+          })),
+          allCategoryKeys: Object.keys(samplesByCategory)
+        });
+        
+        return samplesByCategory;
+      }
+    }
+    
+    console.warn('⚠️ categorySampleProducts: Backend categorySamples not available or not found, falling back to frontend scanning (limited to available rows)');
+    
+    // Strategy 2: Fallback to scanning frontend rows (for eBay products or if backend didn't provide samples)
+    if (!allRowsForCategorySearch || !Array.isArray(allRowsForCategorySearch) || allRowsForCategorySearch.length === 0) {
+      return {};
+    }
+    
+    // Find title column
+    let titleColumn = null;
+    
+    // Strategy 2a: Check defaultMappings (if title was mapped in Step 1)
+    titleColumn = Object.keys(defaultMappings).find(col => defaultMappings[col] === 'title');
+    
+    // Strategy 2b: Check common title column names in csvColumns
+    if (!titleColumn && safeCsvColumns && Array.isArray(safeCsvColumns)) {
+      const commonTitleNames = ['title', 'Title', 'TITLE', 'product_title', 'Product Title', 'name', 'Name', 'product_name', 'Product Name', 'item_title', 'Item Title'];
+      titleColumn = safeCsvColumns.find(col => commonTitleNames.includes(col));
+    }
+    
+    // Strategy 2c: Check actual row keys (case-insensitive)
+    if (!titleColumn && allRowsForCategorySearch.length > 0) {
+      const firstRow = allRowsForCategorySearch[0];
+      if (firstRow && typeof firstRow === 'object') {
+        const rowKeys = Object.keys(firstRow);
+        const titleKey = rowKeys.find(key => {
+          const lowerKey = key.toLowerCase();
+          return lowerKey === 'title' || lowerKey === 'name' || lowerKey.includes('title') || lowerKey.includes('product');
+        });
+        if (titleKey) titleColumn = titleKey;
+      }
+    }
+    
+    if (!titleColumn) {
+      console.log('categorySampleProducts: Could not find title column');
+      return {};
+    }
+    
+    // Group rows by category and collect first 2 products per category
+    const samplesByCategory = {};
+    
+    // Scan through available rows to find products for each category
+    allRowsForCategorySearch.forEach(row => {
+      if (!row || !row.hasOwnProperty(categoryColumn)) return;
+      
+      const rowCategoryValue = row[categoryColumn];
+      if (rowCategoryValue === null || rowCategoryValue === undefined || rowCategoryValue === '') return;
+      
+      // Normalize category value (same as uniqueCategories extraction)
+      const normalizedCategory = String(rowCategoryValue).trim();
+      if (normalizedCategory === '') return;
+      
+      // Initialize array for this category if not exists
+      if (!samplesByCategory[normalizedCategory]) {
+        samplesByCategory[normalizedCategory] = [];
+      }
+      
+      // Only add if we haven't reached 2 products yet for this category
+      if (samplesByCategory[normalizedCategory].length < 2) {
+        const title = row[titleColumn];
+        if (title && String(title).trim()) {
+          samplesByCategory[normalizedCategory].push(String(title).trim());
+        }
+      }
+    });
+    
+    console.log('categorySampleProducts: Scanned frontend rows (fallback)', {
+      categoryColumn,
+      totalRows: allRowsForCategorySearch.length,
+      categoriesWithSamples: Object.keys(samplesByCategory).length,
+      titleColumn,
+      allCategorySamples: Object.entries(samplesByCategory).map(([cat, titles]) => ({ 
+        category: cat, 
+        titles: titles.length,
+        sampleTitles: titles 
+      }))
+    });
+    
+    return samplesByCategory;
+  }, [categoryColumn, allRowsForCategorySearch, defaultMappings, safeCsvColumns, csvPreview]);
+
   // Get sample product titles for a category
+  // Uses pre-computed categorySampleProducts for fast lookup
   const getSampleTitlesForCategory = useCallback((csvCategoryId) => {
-    if (!categoryColumn || !safeSampleRows || !Array.isArray(safeSampleRows)) return [];
+    if (!categoryColumn) {
+      console.log(`getSampleTitlesForCategory: No categoryColumn set for category ${csvCategoryId}`);
+      return [];
+    }
     
-    const titleColumn = Object.keys(defaultMappings).find(col => defaultMappings[col] === 'title');
-    if (!titleColumn) return [];
+    // Normalize category ID for lookup (same normalization as in categorySampleProducts)
+    const normalizedCategoryId = String(csvCategoryId).trim();
     
-    return safeSampleRows
-      .filter(row => row && row[categoryColumn] === csvCategoryId)
-      .slice(0, 3)
-      .map(row => row[titleColumn])
-      .filter(Boolean);
-  }, [categoryColumn, defaultMappings, safeSampleRows]);
+    // Debug: Log all available categories in the pre-computed data
+    const availableCategories = Object.keys(categorySampleProducts);
+    
+    // Try multiple matching strategies
+    let samples = [];
+    
+    // Strategy 1: Exact string match (normalized)
+    if (categorySampleProducts[normalizedCategoryId]) {
+      samples = categorySampleProducts[normalizedCategoryId];
+      console.log(`getSampleTitlesForCategory: Found exact match for "${normalizedCategoryId}"`);
+    }
+    
+    // Strategy 2: Try original value as-is (in case it's already normalized)
+    if (samples.length === 0 && categorySampleProducts[csvCategoryId]) {
+      samples = categorySampleProducts[csvCategoryId];
+      console.log(`getSampleTitlesForCategory: Found match using original value "${csvCategoryId}"`);
+    }
+    
+    // Strategy 3: Numeric comparison
+    if (samples.length === 0) {
+      const targetAsNumber = Number(csvCategoryId);
+      if (!isNaN(targetAsNumber)) {
+        // Try to find by numeric value
+        const matchingKey = Object.keys(categorySampleProducts).find(key => {
+          const keyAsNumber = Number(key);
+          return !isNaN(keyAsNumber) && keyAsNumber === targetAsNumber;
+        });
+        if (matchingKey) {
+          console.log(`getSampleTitlesForCategory: Found numeric match for ${csvCategoryId} -> ${matchingKey}`);
+          samples = categorySampleProducts[matchingKey] || [];
+        }
+      }
+    }
+    
+    // Strategy 4: Case-insensitive string match
+    if (samples.length === 0) {
+      const matchingKey = Object.keys(categorySampleProducts).find(key => {
+        return String(key).trim().toLowerCase() === normalizedCategoryId.toLowerCase();
+      });
+      if (matchingKey) {
+        console.log(`getSampleTitlesForCategory: Found case-insensitive match for "${normalizedCategoryId}" -> "${matchingKey}"`);
+        samples = categorySampleProducts[matchingKey] || [];
+      }
+    }
+    
+    if (samples.length === 0) {
+      console.warn(`getSampleTitlesForCategory: No match found for category "${csvCategoryId}" (normalized: "${normalizedCategoryId}")`, {
+        availableCategories: availableCategories,
+        csvCategoryIdType: typeof csvCategoryId,
+        firstFewAvailable: availableCategories.slice(0, 5),
+        categorySampleProductsSample: Object.entries(categorySampleProducts).slice(0, 3).map(([k, v]) => ({ key: k, keyType: typeof k, samples: v.length }))
+      });
+    } else {
+      console.log(`getSampleTitlesForCategory: Found ${samples.length} samples for category ${csvCategoryId}`);
+    }
+    
+    return samples;
+  }, [categoryColumn, categorySampleProducts]);
 
   useEffect(() => {
     // Load ShareTribe metadata
@@ -897,17 +1184,37 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
                 const sampleTitles = getSampleTitlesForCategory(csvCategoryId);
                 const currentMapping = categoryShareTribeMappings[csvCategoryId];
                 
+                // Debug logging for each category
+                console.log(`Step 2: Rendering category ${csvCategoryId}`, {
+                  sampleTitlesCount: sampleTitles.length,
+                  sampleTitles,
+                  categorySampleProductsKeys: Object.keys(categorySampleProducts),
+                  categoryColumn,
+                  allRowsCount: allRowsForCategorySearch?.length
+                });
+                
                 return (
                   <div key={csvCategoryId} className="border border-gray-200 rounded-lg p-4">
                     <div className="mb-3">
                       <div className="font-semibold text-gray-900 mb-2">CSV Category: {csvCategoryId}</div>
-                      {sampleTitles.length > 0 && (
+                      {sampleTitles.length > 0 ? (
                         <div className="px-3 py-2 bg-blue-50 rounded-lg border border-blue-200">
                           <div className="text-xs font-medium text-blue-900 mb-1">Sample products:</div>
                           <div className="space-y-1">
                             {sampleTitles.map((title, idx) => (
                               <div key={idx} className="text-sm text-blue-800">{title}</div>
                             ))}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="px-3 py-2 bg-gray-50 rounded-lg border border-gray-200">
+                          <div className="text-xs text-gray-500 italic">
+                            No sample products found for this category
+                            {categoryColumn && (
+                              <span className="block text-xs mt-1">
+                                (Debug: Found {Object.keys(categorySampleProducts).length} categories with samples)
+                              </span>
+                            )}
                           </div>
                         </div>
                       )}
@@ -1384,14 +1691,44 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
                               
                               return hasValue;
                             }
-                            // For CSV imports, only show columns that have values in the sample rows for this category
-                            const sampleValue = safeSampleRows.find(row => row[categoryColumn] === csvCategoryId)?.[csvColumn];
-                            return sampleValue !== null && sampleValue !== undefined && sampleValue !== '' && 
-                                   (typeof sampleValue !== 'string' || sampleValue.trim() !== '');
+                            // For CSV imports, check if ANY row in this category has a value for this column
+                            // This ensures columns aren't filtered out if only some products have values
+                            const normalizedCategoryId = String(csvCategoryId).trim();
+                            const categoryRows = safeSampleRows.filter(row => {
+                              if (!row || !categoryColumn || !row[categoryColumn]) return false;
+                              const rowCategory = String(row[categoryColumn]).trim();
+                              return rowCategory === normalizedCategoryId;
+                            });
+                            
+                            // If no products found for this category, show all columns
+                            if (categoryRows.length === 0) {
+                              return true;
+                            }
+                            
+                            // Show if ANY product in this category has a value for this column
+                            const hasValue = categoryRows.some(row => {
+                              const value = row[csvColumn];
+                              return value !== null && value !== undefined && value !== '' && 
+                                     (typeof value !== 'string' || value.trim() !== '');
+                            });
+                            
+                            return hasValue;
                           })
                           .map(csvColumn => {
                           const currentMapping = categoryFieldMapping[csvColumn];
-                          const sampleValue = safeSampleRows.find(row => row[categoryColumn] === csvCategoryId)?.[csvColumn] || '';
+                          // Get sample value from a row in THIS specific category
+                          const normalizedCategoryId = String(csvCategoryId).trim();
+                          const categoryRows = safeSampleRows.filter(row => {
+                            if (!row || !categoryColumn || !row[categoryColumn]) return false;
+                            const rowCategory = String(row[categoryColumn]).trim();
+                            return rowCategory === normalizedCategoryId;
+                          });
+                          // Find first row in this category that has a value for this column
+                          const sampleValue = categoryRows.find(row => {
+                            const value = row[csvColumn];
+                            return value !== null && value !== undefined && value !== '' && 
+                                   (typeof value !== 'string' || value.trim() !== '');
+                          })?.[csvColumn] || '';
                           
                           return (
                             <div key={csvColumn} className="grid grid-cols-12 gap-4 items-center">
@@ -1818,9 +2155,9 @@ const CSVColumnMapping = ({ csvColumns, sampleRows, fileId, csvPreview, onCancel
                                             </div>
                                           );
                                         })}
-                                      </div>
-                                    </div>
-                                  )}
+              </div>
+            </div>
+          )}
                                   
                                   {/* Unmapped ShareTribe Fields */}
                                   {unmappedFields.length > 0 ? (

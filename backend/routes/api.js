@@ -683,9 +683,14 @@ router.post('/products/preview-csv', upload.single('csvFile'), async (req, res) 
     };
     
     return new Promise((resolve, reject) => {
-      const rows = [];
+      const rows = []; // First 1000 rows for preview table
       let headersCaptured = false;
       const categoryColumns = new Set(); // Track potential category columns
+      
+      // Track category samples across ALL rows (not just first 1000)
+      // Structure: categorySamples[categoryColumn][categoryValue] = [title1, title2]
+      const categorySamples = {};
+      let titleColumn = null; // Will be detected from common column names
       
       fs.createReadStream(filePath)
         .pipe(csv())
@@ -699,12 +704,41 @@ router.post('/products/preview-csv', upload.single('csvFile'), async (req, res) 
             preview.columns.forEach(col => {
               preview.uniqueCategories[col] = new Set();
             });
+            
+            // Detect title column (common names) - be more aggressive in detection
+            const commonTitleNames = ['title', 'Title', 'TITLE', 'product_title', 'Product Title', 
+                                     'name', 'Name', 'product_name', 'Product Name', 'item_title', 'Item Title',
+                                     'product name', 'Product Name', 'item name', 'Item Name'];
+            
+            // Try multiple strategies to find title column
+            titleColumn = preview.columns.find(col => commonTitleNames.includes(col)) || 
+                         preview.columns.find(col => col.toLowerCase() === 'title') ||
+                         preview.columns.find(col => col.toLowerCase() === 'name') ||
+                         preview.columns.find(col => col.toLowerCase().includes('title')) ||
+                         preview.columns.find(col => col.toLowerCase().includes('name')) ||
+                         preview.columns.find(col => col.toLowerCase().includes('product')) ||
+                         null; // Allow null if not found
+            
+            console.log(`CSV Preview: Title column detection - Found: ${titleColumn || 'NONE'}`, {
+              availableColumns: preview.columns,
+              matchedColumn: titleColumn
+            });
+            
+            // Initialize categorySamples structure for all columns (in case any becomes a category column)
+            preview.columns.forEach(col => {
+              categorySamples[col] = {};
+            });
           }
           
           preview.rowCount++;
           
-          // Store sample rows (first 10 for display)
-          if (rows.length < 10) {
+          // Log progress every 100 rows to verify we're scanning all rows
+          if (preview.rowCount % 100 === 0) {
+            console.log(`CSV Preview: Processing row ${preview.rowCount}...`);
+          }
+          
+          // Store sample rows (first 1000 for preview table)
+          if (rows.length < 1000) {
             rows.push(data);
           }
           
@@ -713,6 +747,39 @@ router.post('/products/preview-csv', upload.single('csvFile'), async (req, res) 
             const value = data[col];
             if (value !== undefined && value !== null && value.toString().trim() !== '') {
               preview.uniqueCategories[col].add(value.toString().trim());
+              
+              // For each column, track up to 2 sample titles per unique value
+              // This helps find samples for categories that appear later in the file
+              const normalizedValue = value.toString().trim();
+              const isNewCategory = !categorySamples[col][normalizedValue];
+              
+              if (isNewCategory) {
+                categorySamples[col][normalizedValue] = [];
+                // Log when we find a new category (for first 20 categories per column to avoid spam)
+                const existingCategories = Object.keys(categorySamples[col]).length;
+                if (existingCategories <= 20) {
+                  console.log(`CSV Preview: Row ${preview.rowCount} - Found new category in column "${col}": "${normalizedValue}"`);
+                }
+              }
+              
+              // Add title sample if we have a title column and haven't reached 2 samples yet
+              if (titleColumn && categorySamples[col][normalizedValue].length < 2) {
+                const title = data[titleColumn];
+                if (title && String(title).trim()) {
+                  const titleStr = String(title).trim();
+                  // Avoid duplicates
+                  if (!categorySamples[col][normalizedValue].includes(titleStr)) {
+                    categorySamples[col][normalizedValue].push(titleStr);
+                    // Log when we add a sample (for first 10 per column)
+                    if (categorySamples[col][normalizedValue].length <= 2 && Object.keys(categorySamples[col]).length <= 10) {
+                      console.log(`CSV Preview: Row ${preview.rowCount} - Added sample "${titleStr.substring(0, 50)}..." for "${col}"="${normalizedValue}"`);
+                    }
+                  }
+                }
+              } else if (!titleColumn && preview.rowCount <= 5) {
+                // Log warning if title column not found in first few rows
+                console.warn(`CSV Preview: Title column not detected! Row ${preview.rowCount}, available columns: ${preview.columns.join(', ')}`);
+              }
             }
           });
         })
@@ -726,10 +793,79 @@ router.post('/products/preview-csv', upload.single('csvFile'), async (req, res) 
           });
           preview.uniqueCategories = uniqueCategoriesArray;
           
+          // Add categorySamples to preview (scanned from ALL rows)
+          preview.categorySamples = categorySamples;
+          preview.titleColumn = titleColumn;
+          
+          // Log how many rows we scanned and samples found
+          console.log(`CSV Preview: Scanned ${preview.rowCount} total rows`);
+          console.log(`CSV Preview: Sending ${rows.length} sample rows for preview table`);
+          console.log(`CSV Preview: Title column detected: ${titleColumn || 'none'}`);
+          
+          // Log category samples summary with detailed info
+          console.log(`CSV Preview: Summary of categorySamples for all columns:`);
+          Object.keys(categorySamples).forEach(col => {
+            const samples = categorySamples[col];
+            const categoryCount = Object.keys(samples).length;
+            if (categoryCount > 0) {
+              const totalSamples = Object.values(samples).reduce((sum, titles) => sum + titles.length, 0);
+              const categoriesWithSamples = Object.entries(samples).filter(([_, titles]) => titles.length > 0).length;
+              console.log(`CSV Preview: Column "${col}": ${categoryCount} unique values, ${categoriesWithSamples} categories with samples, ${totalSamples} total sample titles`);
+              
+              // Log ALL categories (not just first 10) to verify all are included
+              const allCategories = Object.entries(samples);
+              console.log(`CSV Preview: Column "${col}" - All ${allCategories.length} categories:`, 
+                allCategories.map(([catValue, titles]) => `"${catValue}": ${titles.length} sample(s)`)
+              );
+              
+              // Log first 10 categories with their actual sample titles for debugging
+              const firstFewCategories = Object.entries(samples).slice(0, 10);
+              firstFewCategories.forEach(([catValue, titles]) => {
+                if (titles.length > 0) {
+                  console.log(`  - "${catValue}": ${titles.length} sample(s) - ${titles.join(', ')}`);
+                } else {
+                  console.log(`  - "${catValue}": 0 samples (title column may not be detected)`);
+                }
+              });
+            } else {
+              console.log(`CSV Preview: Column "${col}": 0 unique values (no data found)`);
+            }
+          });
+          
+          // Verify categorySamples structure
+          console.log(`CSV Preview: categorySamples structure has ${Object.keys(categorySamples).length} columns`);
+          const sampleColumns = Object.keys(categorySamples);
+          console.log(`CSV Preview: categorySamples columns: ${sampleColumns.join(', ')}`);
+          
+          // Log a sample of categorySamples to verify structure
+          if (sampleColumns.length > 0) {
+            const firstCol = sampleColumns[0];
+            const firstColSamples = categorySamples[firstCol];
+            const firstColKeys = Object.keys(firstColSamples);
+            console.log(`CSV Preview: Sample column "${firstCol}" has ${firstColKeys.length} unique values`);
+            if (firstColKeys.length > 0) {
+              console.log(`CSV Preview: Sample values for "${firstCol}": ${firstColKeys.slice(0, 5).join(', ')}${firstColKeys.length > 5 ? '...' : ''}`);
+              const firstValue = firstColKeys[0];
+              console.log(`CSV Preview: Sample for "${firstCol}"="${firstValue}": ${JSON.stringify(firstColSamples[firstValue])}`);
+            }
+          }
+          
+          // Verify preview object structure before sending
+          const previewKeys = Object.keys(preview);
+          console.log(`CSV Preview: Preview object keys: ${previewKeys.join(', ')}`);
+          console.log(`CSV Preview: Has categorySamples: ${!!preview.categorySamples}`);
+          console.log(`CSV Preview: categorySamples type: ${typeof preview.categorySamples}`);
+          
           // Don't delete file yet - we'll need it for import
           res.json(preview);
         })
         .on('error', (error) => {
+          console.error('CSV Preview: Error reading CSV file:', error);
+          console.error('CSV Preview: Error details:', {
+            message: error.message,
+            stack: error.stack,
+            rowsProcessed: preview.rowCount
+          });
           if (fs.existsSync(filePath)) {
             fs.unlinkSync(filePath);
           }

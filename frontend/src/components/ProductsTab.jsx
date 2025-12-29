@@ -177,8 +177,9 @@ const ProductsTab = () => {
           } : null
         });
         
-        // Use all products as sample rows (or limit to 50 for performance)
-        const ebaySampleRows = Array.isArray(products) ? products.slice(0, 50) : [];
+        // Use ALL products for category sample finding (not just first 50)
+        // This ensures we can find sample products for categories that appear later in the list
+        const ebaySampleRows = Array.isArray(products) ? products : [];
         
         // Extract unique categories if products have category fields
         const uniqueCategories = {};
@@ -393,6 +394,31 @@ const ProductsTab = () => {
         try {
           // Preview CSV to get columns
           const preview = await previewCSV(file);
+          
+          // Log the full preview response to verify categorySamples is included
+          console.log('ProductsTab: CSV Preview Response:', {
+            hasData: !!preview.data,
+            rowCount: preview.data?.rowCount,
+            sampleRowsCount: preview.data?.sampleRows?.length,
+            hasCategorySamples: !!preview.data?.categorySamples,
+            categorySamplesColumns: preview.data?.categorySamples ? Object.keys(preview.data.categorySamples) : [],
+            titleColumn: preview.data?.titleColumn,
+            fullResponseKeys: preview.data ? Object.keys(preview.data) : []
+          });
+          
+          // Log a sample of categorySamples if it exists
+          if (preview.data?.categorySamples) {
+            const sampleCol = Object.keys(preview.data.categorySamples)[0];
+            if (sampleCol) {
+              const sampleData = preview.data.categorySamples[sampleCol];
+              console.log(`ProductsTab: Sample categorySamples for column "${sampleCol}":`, {
+                uniqueValues: Object.keys(sampleData).length,
+                sampleValues: Object.keys(sampleData).slice(0, 5),
+                firstValueSamples: Object.entries(sampleData).slice(0, 2)
+              });
+            }
+          }
+          
           setCsvPreview(preview.data);
           setShowMappingModal(true);
         } catch (error) {
