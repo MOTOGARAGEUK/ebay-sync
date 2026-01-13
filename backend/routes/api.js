@@ -2020,20 +2020,29 @@ router.post('/sharetribe-users/:id/upload-image', imageUpload.single('image'), a
 });
 
 // Get all users from ShareTribe (for user selection)
+// Note: Requires Integration API credentials (Client ID + Client Secret)
+// Marketplace API does not support querying users
 router.get('/sharetribe-users/query', async (req, res) => {
   try {
     const tenantId = getTenantId(req);
     const config = await syncService.getApiConfig(tenantId);
 
-    if (!config.sharetribe || !config.sharetribe.apiKey || !config.sharetribe.apiSecret) {
+    if (!config.sharetribe || !config.sharetribe.apiKey) {
       return res.status(400).json({ error: 'ShareTribe API credentials not configured' });
     }
 
-    // Initialize ShareTribe service
+    if (!config.sharetribe.apiSecret) {
+      return res.status(400).json({ 
+        error: 'ShareTribe Integration API credentials required. User query requires both Client ID and Client Secret. Marketplace API does not support querying users.' 
+      });
+    }
+
+    // Initialize ShareTribe service with Integration API credentials
     const sharetribeConfig = {
       apiKey: config.sharetribe.apiKey,
-      apiSecret: config.sharetribe.apiSecret,
+      apiSecret: config.sharetribe.apiSecret, // Required for Integration API
       marketplaceId: config.sharetribe.marketplaceId,
+      marketplaceApiClientId: config.sharetribe.marketplaceApiClientId || '', // Optional
       userId: '' // Not needed for querying users
     };
 

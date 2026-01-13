@@ -702,7 +702,8 @@ const ApiConfigTab = () => {
                     type="text"
                     value={userForm.name || ''}
                     onChange={(e) => setUserForm({ ...userForm, name: e.target.value })}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                    disabled={!!selectedApiUser}
+                    className={`w-full px-3 py-2 border border-gray-300 rounded-lg ${selectedApiUser ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''}`}
                     placeholder="User display name"
                   />
                 </div>
@@ -717,7 +718,19 @@ const ApiConfigTab = () => {
                           const user = shareTribeApiUsers.find(u => u.id === userId);
                           setSelectedApiUser(user || null);
                           if (user) {
-                            setUserForm({ ...userForm, sharetribe_user_id: user.id });
+                            // Populate name and user ID, and disable editing
+                            setUserForm({ 
+                              ...userForm, 
+                              sharetribe_user_id: user.id,
+                              name: user.profile?.displayName || user.email || user.id
+                            });
+                          } else {
+                            // Clear name when no user is selected
+                            setUserForm({ 
+                              ...userForm, 
+                              sharetribe_user_id: '',
+                              name: ''
+                            });
                           }
                         }}
                         className="flex-1 px-3 py-2 border border-gray-300 rounded-lg"
@@ -783,7 +796,8 @@ const ApiConfigTab = () => {
                         setUserForm({ ...userForm, sharetribe_user_id: e.target.value });
                         setSelectedApiUser(null); // Clear selection when manually typing
                       }}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                      disabled={!!selectedApiUser}
+                      className={`w-full px-3 py-2 border border-gray-300 rounded-lg ${selectedApiUser ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : ''}`}
                       placeholder="Or manually enter User UUID"
                     />
                   </div>

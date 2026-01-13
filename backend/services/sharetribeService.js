@@ -2502,20 +2502,27 @@ class ShareTribeService {
   }
 
   // Get all users from ShareTribe Integration API
+  // Note: Marketplace API does not support querying users - must use Integration API
   async getAllUsers() {
     try {
+      // Integration API requires apiSecret (client_secret)
       if (!this.isIntegrationAPI) {
-        throw new Error('User query is only available with Integration API');
+        throw new Error('User query requires Integration API credentials (Client ID + Client Secret). Marketplace API does not support querying users.');
       }
 
       const headers = await this.getAuthHeaders();
+      
+      // Integration API endpoint for querying users
+      // GET /v1/integration_api/users/query - List all users
       const apiUrl = `https://flex-integ-api.sharetribe.com/v1/integration_api/users/query`;
       
-      console.log('Fetching users from ShareTribe...');
+      console.log('Fetching users from ShareTribe Integration API...');
+      console.log('Marketplace ID:', this.marketplaceId);
+      console.log('Using endpoint: GET', apiUrl);
       
-      const response = await axios.post(
+      // Integration API uses GET request for /users/query
+      const response = await axios.get(
         apiUrl,
-        {}, // Empty query to get all users
         {
           headers: headers,
           validateStatus: function (status) {
@@ -2523,44 +2530,126 @@ class ShareTribeService {
           }
         }
       );
-
+      
+      console.log(`Response status: ${response.status}`);
+      console.log(`Response data keys:`, response.data ? Object.keys(response.data) : 'no data');
+      if (response.data) {
+        console.log(`Response data preview:`, JSON.stringify(response.data, null, 2).substring(0, 1000));
+      }
+      
       if (response.status >= 200 && response.status < 300) {
         const users = [];
         
-        // Parse ShareTribe API response structure
+        // Integration API response structure: { data: [{ id, type, attributes: {...} }, ...] }
+        let userDataArray = [];
+        
         if (response.data && response.data.data) {
-          response.data.data.forEach(userData => {
-            const attributes = userData.attributes || {};
-            const relationships = userData.relationships || {};
-            
-            // Extract user information
-            const user = {
-              id: userData.id,
-              profile: {
-                displayName: attributes.profile?.displayName || attributes.displayName || 'N/A',
-                bio: attributes.profile?.bio || attributes.bio || 'N/A',
-                firstName: attributes.profile?.firstName || attributes.firstName || '',
-                lastName: attributes.profile?.lastName || attributes.lastName || '',
-              },
-              email: attributes.email || 'N/A',
-              stripeAccountId: attributes.stripeAccountId || attributes.stripe_account_id || null,
-              publicData: attributes.publicData || {},
-              createdAt: attributes.createdAt || attributes.created_at || null,
-              updatedAt: attributes.updatedAt || attributes.updated_at || null,
-            };
-            
-            users.push(user);
-          });
+          if (Array.isArray(response.data.data)) {
+            userDataArray = response.data.data;
+            console.log(`Found ${userDataArray.length} users in response.data.data array`);
+          } else {
+            console.log('Unexpected response structure:', JSON.stringify(response.data, null, 2).substring(0, 1000));
+          }
+        } else {
+          console.log('Response data structure:', JSON.stringify(response.data, null, 2).substring(0, 1000));
         }
         
-        console.log(`✅ Fetched ${users.length} users from ShareTribe`);
+        userDataArray.forEach(userData => {
+          const attributes = userData.attributes || {};
+          
+          // Extract user information according to Integration API structure
+          const user = {
+            id: userData.id,
+            profile: {
+              displayName: attributes.profile?.displayName || attributes.displayName || 'N/A',
+              abbreviatedName: attributes.profile?.abbreviatedName || '',
+              bio: attributes.profile?.bio || attributes.bio || '',
+              firstName: attributes.profile?.firstName || attributes.firstName || '',
+              lastName: attributes.profile?.lastName || attributes.lastName || '',
+              publicData: attributes.profile?.publicData || {},
+              metadata: attributes.profile?.metadata || {}
+            },
+            email: attributes.email || 'N/A',
+            banned: attributes.banned || false,
+            deleted: attributes.deleted || false,
+            state: attributes.state || 'unknown',
+            createdAt: attributes.createdAt || null,
+            updatedAt: attributes.updatedAt || null
+          };
+          
+          users.push(user);
+        });
+        
+        console.log(`✅ Fetched ${users.length} users from ShareTribe Integration API`);
+        if (users.length > 0) {
+          console.log(`First user sample:`, JSON.stringify(users[0], null, 2));
+        }
         return users;
       } else {
-        console.error('ShareTribe API returned error:', response.status, response.data);
+        console.error('ShareTribe Integration API returned error:', response.status, response.data);
+        throw new Error(`ShareTribe API returned status ${response.status}: ${JSON.stringify(response.data)}`);
+      }
+
+      console.log(`Response status: ${response.status}`);
+      console.log(`Response data keys:`, response.data ? Object.keys(response.data) : 'no data');
+      
+      if (response.status >= 200 && response.status < 300) {
+        const users = [];
+        
+        // Integration API response structure: { data: [{ id, type, attributes: {...} }, ...] }
+        let userDataArray = [];
+        
+        if (response.data && response.data.data) {
+          if (Array.isArray(response.data.data)) {
+            userDataArray = response.data.data;
+            console.log(`Found ${userDataArray.length} users in response.data.data array`);
+          } else {
+            console.log('Unexpected response structure:', JSON.stringify(response.data, null, 2).substring(0, 1000));
+          }
+        } else {
+          console.log('Response data structure:', JSON.stringify(response.data, null, 2).substring(0, 1000));
+        }
+        
+        userDataArray.forEach(userData => {
+          const attributes = userData.attributes || {};
+          
+          // Extract user information according to Integration API structure
+          const user = {
+            id: userData.id,
+            profile: {
+              displayName: attributes.profile?.displayName || attributes.displayName || 'N/A',
+              abbreviatedName: attributes.profile?.abbreviatedName || '',
+              bio: attributes.profile?.bio || attributes.bio || '',
+              firstName: attributes.profile?.firstName || attributes.firstName || '',
+              lastName: attributes.profile?.lastName || attributes.lastName || '',
+              publicData: attributes.profile?.publicData || {},
+              metadata: attributes.profile?.metadata || {}
+            },
+            email: attributes.email || 'N/A',
+            banned: attributes.banned || false,
+            deleted: attributes.deleted || false,
+            state: attributes.state || 'unknown',
+            createdAt: attributes.createdAt || null,
+            updatedAt: attributes.updatedAt || null
+          };
+          
+          users.push(user);
+        });
+        
+        console.log(`✅ Fetched ${users.length} users from ShareTribe Integration API`);
+        if (users.length > 0) {
+          console.log(`First user sample:`, JSON.stringify(users[0], null, 2));
+        }
+        return users;
+      } else {
+        console.error('ShareTribe Integration API returned error:', response.status, response.data);
         throw new Error(`ShareTribe API returned status ${response.status}: ${JSON.stringify(response.data)}`);
       }
     } catch (error) {
       console.error('Error fetching users from ShareTribe:', error.response?.data || error.message);
+      if (error.response?.data) {
+        console.error('Full error response:', JSON.stringify(error.response.data, null, 2));
+      }
       throw new Error(`Failed to fetch users from ShareTribe: ${error.response?.data?.errors?.[0]?.title || error.message}`);
     }
   }
