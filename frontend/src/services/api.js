@@ -34,7 +34,7 @@ export const previewCSV = (file) => {
     },
   });
 };
-export const uploadCSV = (file, columnMappings, fileId, categoryMappings = {}, categoryColumn = null, categoryFieldMappings = {}, categoryListingTypeMappings = {}, valueMappings = {}, unmappedFieldValues = {}) => {
+export const uploadCSV = (file, columnMappings, fileId, categoryMappings = {}, categoryColumn = null, categoryFieldMappings = {}, categoryListingTypeMappings = {}, valueMappings = {}, unmappedFieldValues = {}, sharetribeUserId = null) => {
   const formData = new FormData();
   formData.append('csvFile', file);
   formData.append('columnMappings', JSON.stringify(columnMappings));
@@ -57,6 +57,9 @@ export const uploadCSV = (file, columnMappings, fileId, categoryMappings = {}, c
     formData.append('unmappedFieldValues', JSON.stringify(unmappedFieldValues));
   }
   if (fileId) formData.append('fileId', fileId);
+  if (sharetribeUserId) {
+    formData.append('sharetribe_user_id', sharetribeUserId);
+  }
   return api.post('/products/upload-csv', formData, {
     headers: {
       'Content-Type': 'multipart/form-data',
@@ -89,11 +92,11 @@ export const previewPayload = (itemIds = null, sharetribeUserId = null) =>
   api.post('/sync/preview', { item_ids: itemIds, sharetribe_user_id: sharetribeUserId });
 
 // Remove products (delete from database)
-export const removeProducts = (itemIds = null) => 
-  api.post('/products/remove', { item_ids: itemIds });
+export const removeProducts = (itemIds = null, sharetribeUserId = null) => 
+  api.post('/products/remove', { item_ids: itemIds, sharetribe_user_id: sharetribeUserId });
 
 // Apply mappings to eBay products
-export const applyEbayProductMappings = (columnMappings, categoryMappings = {}, categoryColumn = null, categoryFieldMappings = {}, categoryListingTypeMappings = {}, valueMappings = {}, unmappedFieldValues = {}) => {
+export const applyEbayProductMappings = (columnMappings, categoryMappings = {}, categoryColumn = null, categoryFieldMappings = {}, categoryListingTypeMappings = {}, valueMappings = {}, unmappedFieldValues = {}, sharetribeUserId = null) => {
   return api.post('/products/apply-ebay-mappings', {
     columnMappings,
     categoryMappings,
@@ -101,7 +104,8 @@ export const applyEbayProductMappings = (columnMappings, categoryMappings = {}, 
     categoryFieldMappings,
     categoryListingTypeMappings,
     valueMappings,
-    unmappedFieldValues
+    unmappedFieldValues,
+    sharetribe_user_id: sharetribeUserId
   });
 };
 

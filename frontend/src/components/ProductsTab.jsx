@@ -27,7 +27,7 @@ const ProductsTab = () => {
   useEffect(() => {
     loadProducts();
     loadShareTribeUsers();
-  }, [activeTab, searchTerm]);
+  }, [activeTab, searchTerm, selectedShareTribeUser]);
 
   const loadShareTribeUsers = async () => {
     try {
@@ -41,12 +41,26 @@ const ProductsTab = () => {
   const loadProducts = async () => {
     setLoading(true);
     try {
-      // Always load all products for accurate tab counts
-      const allResponse = await getProducts({});
+      // Build params for filtering
+      const params = {};
+      
+      // Always require a user selection - filter by selected user
+      if (!selectedShareTribeUser) {
+        // No user selected - don't load products
+        setAllProducts([]);
+        setProducts([]);
+        setLoading(false);
+        return;
+      }
+      
+      params.sharetribe_user_id = selectedShareTribeUser;
+      
+      // Load all products for accurate tab counts (with user filter, but no synced filter)
+      const allParams = { ...params };
+      const allResponse = await getProducts(allParams);
       setAllProducts(allResponse.data || []);
       
-      // Load filtered products based on active tab
-      const params = {};
+      // Load filtered products based on active tab and selected user
       if (activeTab === 'synced') params.synced = 'true';
       if (activeTab === 'imported') params.synced = 'false';
       // 'all' tab doesn't filter by synced status
@@ -372,7 +386,11 @@ const ProductsTab = () => {
 
     setRemovingFromSync(true);
     try {
-      const result = await removeProducts(productsToRemove);
+      if (!selectedShareTribeUser) {
+        alert('Please select a ShareTribe user before removing products.');
+        return;
+      }
+      const result = await removeProducts(productsToRemove, selectedShareTribeUser);
       alert(`Successfully removed ${result.data.count} product(s).`);
       await loadProducts();
       setSelectedProducts(new Set());
@@ -449,6 +467,12 @@ const ProductsTab = () => {
       return;
     }
 
+    // For CSV upload (not eBay mapping), require ShareTribe user selection
+    if (!isEbayMapping && !selectedShareTribeUser) {
+      alert('Please select a ShareTribe user before importing CSV. Products must be associated with a user.');
+      return;
+    }
+
     setUploadingCSV(true);
     setShowMappingModal(false);
     
@@ -463,6 +487,10 @@ const ProductsTab = () => {
         const categoryMappings = categoryShareTribeMappings || {};
         
         try {
+          if (!selectedShareTribeUser) {
+            alert('Please select a ShareTribe user before applying mappings.');
+            return;
+          }
           const result = await applyEbayProductMappings(
             columnMappings,
             categoryMappings,
@@ -470,7 +498,8 @@ const ProductsTab = () => {
             categoryFieldMappings,
             categoryListingTypeMappings,
             valueMappings,
-            unmappedFieldValues
+            unmappedFieldValues,
+            selectedShareTribeUser
           );
           
           alert(`✅ eBay product mappings applied successfully!\n\nUpdated ${result.data.count || 0} product(s).\n\nYou can now sync these products to ShareTribe.`);
@@ -491,7 +520,7 @@ const ProductsTab = () => {
       const columnMappings = { ...defaultMappings };
       const categoryMappings = categoryShareTribeMappings || {};
       
-      const result = await uploadCSV(csvFile, columnMappings, csvPreview?.fileId, categoryMappings, categoryColumn, categoryFieldMappings, categoryListingTypeMappings, valueMappings, unmappedFieldValues);
+      const result = await uploadCSV(csvFile, columnMappings, csvPreview?.fileId, categoryMappings, categoryColumn, categoryFieldMappings, categoryListingTypeMappings, valueMappings, unmappedFieldValues, selectedShareTribeUser);
       
       // Log debug information
       console.log('CSV Import Result:', result.data);
@@ -536,22 +565,30 @@ const ProductsTab = () => {
 
   // Filter products based on active tab and search term
   const filteredProducts = products.filter(product => {
-    // Tab filtering
-    if (activeTab === 'synced' && !product.synced) return false;
-    if (activeTab === 'imported' && product.synced) return false;
-    // 'all' tab shows everything
-    
-    // Search filtering (only applies to synced tab)
-    if (searchTerm && activeTab === 'synced') {
-      const searchLower = searchTerm.toLowerCase();
-      return (
-        product.title?.toLowerCase().includes(searchLower) ||
-        product.description?.toLowerCase().includes(searchLower) ||
-        product.ebay_item_id?.toString().includes(searchTerm)
-      );
+    try {
+      // Tab filtering
+      // Handle null/undefined synced values properly
+      const isSynced = product.synced === true || product.synced === 1;
+      
+      if (activeTab === 'synced' && !isSynced) return false;
+      if (activeTab === 'imported' && isSynced) return false;
+      // 'all' tab shows everything (no filtering by synced status)
+      
+      // Search filtering (only applies to synced tab)
+      if (searchTerm && activeTab === 'synced') {
+        const searchLower = searchTerm.toLowerCase();
+        return (
+          product.title?.toLowerCase().includes(searchLower) ||
+          product.description?.toLowerCase().includes(searchLower) ||
+          product.ebay_item_id?.toString().includes(searchTerm)
+        );
+      }
+      
+      return true;
+    } catch (error) {
+      console.error('Error filtering product:', error, product);
+      return false; // Exclude products that cause errors
     }
-    
-    return true;
   });
 
   return (
@@ -559,14 +596,15 @@ const ProductsTab = () => {
       {/* ShareTribe User Selection */}
       <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
         <label className="block text-sm font-medium text-gray-700 mb-2">
-          Select ShareTribe User (Products will be created on behalf of this user)
+          Select ShareTribe User <span className="text-xs text-gray-500">(Required)</span>
         </label>
         <select
           value={selectedShareTribeUser || ''}
           onChange={(e) => setSelectedShareTribeUser(e.target.value ? parseInt(e.target.value) : null)}
           className="w-full md:w-1/3 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+          required
         >
-          <option value="">-- Select ShareTribe User --</option>
+          <option value="">-- Select a User --</option>
           {shareTribeUsers.map(user => (
             <option key={user.id} value={user.id}>
               {user.name} ({user.sharetribe_user_id})
@@ -576,6 +614,16 @@ const ProductsTab = () => {
         {shareTribeUsers.length === 0 && (
           <p className="mt-2 text-xs text-gray-500">
             No ShareTribe users configured. Please add users in the API Configuration tab.
+          </p>
+        )}
+        {selectedShareTribeUser && (
+          <p className="mt-2 text-xs text-blue-600">
+            💡 Showing products for the selected user only.
+          </p>
+        )}
+        {!selectedShareTribeUser && shareTribeUsers.length > 0 && (
+          <p className="mt-2 text-xs text-yellow-600">
+            ⚠️ Please select a ShareTribe user to view products.
           </p>
         )}
       </div>
@@ -698,7 +746,7 @@ const ProductsTab = () => {
                   : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
               }`}
             >
-              Imported ({allProducts.filter(p => !p.synced).length})
+              Imported ({allProducts.filter(p => !(p.synced === true || p.synced === 1)).length})
             </button>
             <button
               onClick={() => {
@@ -711,7 +759,7 @@ const ProductsTab = () => {
                   : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
               }`}
             >
-              Synced ({allProducts.filter(p => p.synced).length})
+              Synced ({allProducts.filter(p => p.synced === true || p.synced === 1).length})
             </button>
             <button
               onClick={() => {
@@ -819,18 +867,20 @@ const ProductsTab = () => {
                       </div>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                      {product.price ? `${product.currency || 'GBP'} ${product.price.toFixed(2)}` : 'N/A'}
+                      {product.price && typeof product.price === 'number' 
+                        ? `${product.currency || 'GBP'} ${product.price.toFixed(2)}` 
+                        : product.price || 'N/A'}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
                       {product.quantity || 0}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
-                      {product.synced ? (
+                      {(product.synced === true || product.synced === 1) ? (
                         <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
                           <CheckCircle size={14} className="mr-1" />
                           Synced
                         </span>
-                      ) : product.quantity > 0 ? (
+                      ) : (product.quantity && (typeof product.quantity === 'number' ? product.quantity > 0 : parseInt(product.quantity) > 0)) ? (
                         <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800">
                           <AlertCircle size={14} className="mr-1" />
                           Not Synced

@@ -144,13 +144,21 @@ class SyncService {
       return completeProduct;
     };
     
+    // CRITICAL: Filter products by user_id to prevent cross-user sync
+    // Only sync products that belong to the specified ShareTribe user
+    const userFilter = sharetribeUserId 
+      ? ' AND user_id = ?'
+      : ' AND user_id IS NULL';
+    
+    const userFilterParams = sharetribeUserId ? [sharetribeUserId] : [];
+    
     if (itemIds && itemIds.length > 0) {
-      // Sync specific items from database
+      // Sync specific items from database (scoped to user)
       const placeholders = itemIds.map(() => '?').join(',');
       productsToSync = await new Promise((resolve, reject) => {
         dbInstance.all(
-          `SELECT * FROM products WHERE tenant_id = ? AND ebay_item_id IN (${placeholders})`,
-          [tenantId, ...itemIds],
+          `SELECT * FROM products WHERE tenant_id = ?${userFilter} AND ebay_item_id IN (${placeholders})`,
+          [tenantId, ...userFilterParams, ...itemIds],
           (err, rows) => {
             if (err) {
               reject(err);
@@ -175,11 +183,11 @@ class SyncService {
         );
       });
     } else {
-      // Sync all products from database
+      // Sync all products from database (scoped to user)
       productsToSync = await new Promise((resolve, reject) => {
         dbInstance.all(
-          'SELECT * FROM products WHERE tenant_id = ?',
-          [tenantId],
+          `SELECT * FROM products WHERE tenant_id = ?${userFilter}`,
+          [tenantId, ...userFilterParams],
           (err, rows) => {
             if (err) {
               reject(err);
@@ -617,35 +625,54 @@ class SyncService {
       
       const customFieldsJson = Object.keys(customFields).length > 0 ? JSON.stringify(customFields) : null;
       
-      // First check if product exists
-      dbInstance.get(
-        'SELECT id FROM products WHERE tenant_id = ? AND ebay_item_id = ?',
-        [tenantId, productData.ebay_item_id],
-        (err, row) => {
-          if (err) {
-            reject(err);
-            return;
-          }
+      // CRITICAL: Use composite key (user_id + ebay_item_id) to prevent cross-user collisions
+      // Products are scoped per user - same ebay_item_id can exist for different users
+      const userId = productData.user_id || null;
+      
+      // First check if product exists for THIS user
+      const lookupQuery = userId !== null
+        ? 'SELECT id FROM products WHERE tenant_id = ? AND user_id = ? AND ebay_item_id = ?'
+        : 'SELECT id FROM products WHERE tenant_id = ? AND user_id IS NULL AND ebay_item_id = ?';
+      
+      const lookupParams = userId !== null
+        ? [tenantId, userId, productData.ebay_item_id]
+        : [tenantId, productData.ebay_item_id];
+      
+      dbInstance.get(lookupQuery, lookupParams, (err, row) => {
+        if (err) {
+          reject(err);
+          return;
+        }
 
-          if (row) {
-            // Update existing product
-            console.log(`Updating product ${productData.ebay_item_id}:`, {
-              title: productData.title,
-              titleType: typeof productData.title,
-              description: productData.description,
-              price: productData.price,
-              allFields: Object.keys(productData),
-              customFields: customFields,
-              allValues: Object.entries(productData).map(([k, v]) => `${k}: ${v !== null && v !== undefined ? v : 'NULL/UNDEFINED'}`).join(', ')
-            });
-            dbInstance.run(
-              `UPDATE products SET
+        if (row) {
+          // Update existing product (only if it belongs to the same user)
+          console.log(`Updating product ${productData.ebay_item_id} for user ${userId}:`, {
+            title: productData.title,
+            titleType: typeof productData.title,
+            description: productData.description,
+            price: productData.price,
+            allFields: Object.keys(productData),
+            customFields: customFields,
+            allValues: Object.entries(productData).map(([k, v]) => `${k}: ${v !== null && v !== undefined ? v : 'NULL/UNDEFINED'}`).join(', ')
+          });
+          
+          // CRITICAL: Update must filter by user_id to prevent cross-user updates
+          const updateQuery = userId !== null
+            ? `UPDATE products SET
                 title = ?, description = ?, price = ?, currency = ?, quantity = ?,
                 images = ?, category = ?, condition = ?, brand = ?, sku = ?,
                 synced = ?, sharetribe_listing_id = ?, last_synced_at = ?,
                 user_id = ?, custom_fields = ?, updated_at = CURRENT_TIMESTAMP
-              WHERE id = ?`,
-              [
+              WHERE id = ? AND user_id = ?`
+            : `UPDATE products SET
+                title = ?, description = ?, price = ?, currency = ?, quantity = ?,
+                images = ?, category = ?, condition = ?, brand = ?, sku = ?,
+                synced = ?, sharetribe_listing_id = ?, last_synced_at = ?,
+                user_id = ?, custom_fields = ?, updated_at = CURRENT_TIMESTAMP
+              WHERE id = ? AND user_id IS NULL`;
+          
+          const updateParams = userId !== null
+            ? [
                 productData.title || null,
                 productData.description || null,
                 productData.price || 0,
@@ -659,19 +686,41 @@ class SyncService {
                 productData.synced ? 1 : 0,
                 productData.sharetribe_listing_id || null,
                 productData.last_synced_at || null,
-                productData.user_id || null,
+                userId,
+                customFieldsJson,
+                row.id,
+                userId // Additional filter to ensure we only update this user's product
+              ]
+            : [
+                productData.title || null,
+                productData.description || null,
+                productData.price || 0,
+                productData.currency || 'USD',
+                productData.quantity || 0,
+                productData.images || null,
+                productData.category || null,
+                productData.condition || null,
+                productData.brand || null,
+                productData.sku || null,
+                productData.synced ? 1 : 0,
+                productData.sharetribe_listing_id || null,
+                productData.last_synced_at || null,
+                null,
                 customFieldsJson,
                 row.id
-              ],
-              function(updateErr) {
-                if (updateErr) {
-                  reject(updateErr);
-                } else {
-                  resolve({ id: row.id });
-                }
+              ];
+          
+          dbInstance.run(updateQuery, updateParams, function(updateErr) {
+            if (updateErr) {
+              reject(updateErr);
+            } else {
+              if (this.changes === 0) {
+                console.warn(`⚠️ Update affected 0 rows for product ${productData.ebay_item_id} - product may belong to different user`);
               }
-            );
-          } else {
+              resolve({ id: row.id });
+            }
+          });
+        } else {
             // Insert new product
             dbInstance.run(
               `INSERT INTO products (
@@ -833,10 +882,30 @@ class SyncService {
 
     console.log(`✅ Fetched ${products.length} listings from eBay`);
 
+    // Get the ShareTribe user database ID if provided
+    let sharetribeUserDbId = null;
+    if (sharetribeUserId) {
+      // sharetribeUserId might be the database ID or UUID, we need the database ID
+      const sharetribeUser = await new Promise((resolve, reject) => {
+        dbInstance.get(
+          `SELECT id FROM sharetribe_users WHERE id = ? OR sharetribe_user_id = ?`,
+          [sharetribeUserId, sharetribeUserId],
+          (err, row) => {
+            if (err) reject(err);
+            else resolve(row);
+          }
+        );
+      });
+      if (sharetribeUser) {
+        sharetribeUserDbId = sharetribeUser.id;
+      }
+    }
+
     for (const product of products) {
       await this.upsertProduct(tenantId, {
         ...product,
-        synced: false // Mark as needing sync
+        synced: false, // Mark as needing sync
+        user_id: sharetribeUserDbId || null // Associate with ShareTribe user
       });
     }
 

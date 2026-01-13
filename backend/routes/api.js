@@ -496,7 +496,9 @@ router.get('/products', (req, res) => {
       return res.status(500).json({ error: 'Database connection failed' });
     }
     
-    const { synced, search } = req.query || {};
+    const { synced, search, sharetribe_user_id } = req.query || {};
+    
+    console.log(`📋 GET /products - Query params:`, { synced, search, sharetribe_user_id });
     
     let query = 'SELECT * FROM products WHERE tenant_id = ?';
     const params = [tenantId];
@@ -504,6 +506,25 @@ router.get('/products', (req, res) => {
     if (synced !== undefined && synced !== null && synced !== '') {
       query += ' AND synced = ?';
       params.push(synced === 'true' ? 1 : 0);
+    }
+    
+    // CRITICAL: Always require user_id filter for user scoping
+    // Products must be scoped to a specific user - no cross-user visibility
+    if (sharetribe_user_id === undefined || sharetribe_user_id === null || sharetribe_user_id === '') {
+      // No user provided - return empty result
+      console.log('⚠️ No sharetribe_user_id provided - returning empty result (user selection required)');
+      query += ' AND 1 = 0'; // Always false condition
+    } else {
+      const userId = parseInt(sharetribe_user_id);
+      if (!isNaN(userId) && userId > 0) {
+        query += ' AND user_id = ?';
+        params.push(userId);
+        console.log(`✅ Filtering products by user_id: ${userId} (strict user scoping)`);
+      } else {
+        console.warn(`⚠️ Invalid sharetribe_user_id provided: ${sharetribe_user_id}, showing no products`);
+        // Return empty result for invalid user ID
+        query += ' AND 1 = 0'; // Always false condition
+      }
     }
     
     if (search && typeof search === 'string' && search.trim()) {
@@ -889,7 +910,29 @@ router.post('/products/upload-csv', upload.single('csvFile'), async (req, res) =
   try {
     const tenantId = getTenantId(req);
     const filePath = req.file.path;
-    const { columnMappings, categoryMappings, categoryColumn, categoryFieldMappings, categoryListingTypeMappings, valueMappings, unmappedFieldValues, productFieldMappings, productUnmappedFieldValues } = req.body;
+    const { columnMappings, categoryMappings, categoryColumn, categoryFieldMappings, categoryListingTypeMappings, valueMappings, unmappedFieldValues, productFieldMappings, productUnmappedFieldValues, sharetribe_user_id } = req.body;
+    
+    // Get ShareTribe user database ID if provided
+    let sharetribeUserDbId = null;
+    if (sharetribe_user_id) {
+      const dbInstance = db.getDb();
+      const sharetribeUser = await new Promise((resolve, reject) => {
+        dbInstance.get(
+          `SELECT id FROM sharetribe_users WHERE id = ? OR sharetribe_user_id = ?`,
+          [sharetribe_user_id, sharetribe_user_id],
+          (err, row) => {
+            if (err) reject(err);
+            else resolve(row);
+          }
+        );
+      });
+      if (sharetribeUser) {
+        sharetribeUserDbId = sharetribeUser.id;
+        console.log(`📌 CSV import will associate products with ShareTribe user ID: ${sharetribeUserDbId}`);
+      } else {
+        console.warn(`⚠️ ShareTribe user ${sharetribe_user_id} not found, products will not be associated with a user`);
+      }
+    }
     
     // Parse column mappings from JSON string if needed
     let mappings = columnMappings;
@@ -1051,7 +1094,8 @@ router.post('/products/upload-csv', upload.single('csvFile'), async (req, res) =
         
         await syncService.upsertProduct(tenantId, {
           ...product,
-          synced: false
+          synced: false,
+          user_id: sharetribeUserDbId || null // Associate with ShareTribe user if provided
         });
         
         importedCount++;
@@ -1116,25 +1160,54 @@ router.post('/products/apply-ebay-mappings', async (req, res) => {
       categoryFieldMappings = {},
       categoryListingTypeMappings = {},
       valueMappings = {},
-      unmappedFieldValues = {}
+      unmappedFieldValues = {},
+      sharetribe_user_id
     } = req.body;
 
     console.log('📝 Applying eBay product mappings:', {
       columnMappingsCount: Object.keys(columnMappings || {}).length,
       categoryMappingsCount: Object.keys(categoryMappings).length,
       categoryColumn,
-      categoryFieldMappingsCount: Object.keys(categoryFieldMappings).length
+      categoryFieldMappingsCount: Object.keys(categoryFieldMappings).length,
+      sharetribe_user_id
     });
 
     const dbInstance = db.getDb();
     const csvService = require('../services/csvService');
     const syncService = require('../services/syncService');
 
-    // Get all products from database (they have eBay field names)
+    // CRITICAL: Filter products by user_id to prevent cross-user updates
+    // Get ShareTribe user database ID if provided
+    let sharetribeUserDbId = null;
+    if (sharetribe_user_id) {
+      const sharetribeUser = await new Promise((resolve, reject) => {
+        dbInstance.get(
+          `SELECT id FROM sharetribe_users WHERE id = ? OR sharetribe_user_id = ?`,
+          [sharetribe_user_id, sharetribe_user_id],
+          (err, row) => {
+            if (err) reject(err);
+            else resolve(row);
+          }
+        );
+      });
+      if (sharetribeUser) {
+        sharetribeUserDbId = sharetribeUser.id;
+        console.log(`📌 Applying mappings to products for ShareTribe user ID: ${sharetribeUserDbId}`);
+      } else {
+        return res.status(400).json({ error: `ShareTribe user ${sharetribe_user_id} not found` });
+      }
+    } else {
+      return res.status(400).json({ error: 'ShareTribe user ID is required to apply mappings' });
+    }
+
+    // Get products from database filtered by user_id (they have eBay field names)
+    const userFilter = sharetribeUserDbId !== null ? ' AND user_id = ?' : ' AND user_id IS NULL';
+    const userFilterParams = sharetribeUserDbId !== null ? [sharetribeUserDbId] : [];
+    
     const products = await new Promise((resolve, reject) => {
       dbInstance.all(
-        'SELECT * FROM products WHERE tenant_id = ?',
-        [tenantId],
+        `SELECT * FROM products WHERE tenant_id = ?${userFilter}`,
+        [tenantId, ...userFilterParams],
         (err, rows) => {
           if (err) reject(err);
           else resolve(rows || []);
@@ -1226,10 +1299,11 @@ router.post('/products/apply-ebay-mappings', async (req, res) => {
           mappedProduct.description = completeProduct.description;
         }
 
-        // Update product in database
+        // Update product in database (with user_id to maintain ownership)
         await syncService.upsertProduct(tenantId, {
           ...mappedProduct,
-          synced: false // Mark as needing sync after mapping update
+          synced: false, // Mark as needing sync after mapping update
+          user_id: sharetribeUserDbId // Maintain user ownership
         });
 
         updatedCount++;
@@ -1410,12 +1484,34 @@ router.post('/sync/preview', async (req, res) => {
       return completeProduct;
     };
     
+    // CRITICAL: Filter products by user_id to prevent cross-user preview
+    // Get ShareTribe user database ID if provided
+    let sharetribeUserDbId = null;
+    if (sharetribe_user_id) {
+      const sharetribeUser = await new Promise((resolve, reject) => {
+        dbInstance.get(
+          `SELECT id FROM sharetribe_users WHERE id = ? OR sharetribe_user_id = ?`,
+          [sharetribe_user_id, sharetribe_user_id],
+          (err, row) => {
+            if (err) reject(err);
+            else resolve(row);
+          }
+        );
+      });
+      if (sharetribeUser) {
+        sharetribeUserDbId = sharetribeUser.id;
+      }
+    }
+    
+    const userFilter = sharetribeUserDbId !== null ? ' AND user_id = ?' : ' AND user_id IS NULL';
+    const userFilterParams = sharetribeUserDbId !== null ? [sharetribeUserDbId] : [];
+    
     if (item_ids && item_ids.length > 0) {
       const placeholders = item_ids.map(() => '?').join(',');
       productsToPreview = await new Promise((resolve, reject) => {
         dbInstance.all(
-          `SELECT * FROM products WHERE tenant_id = ? AND ebay_item_id IN (${placeholders})`,
-          [tenantId, ...item_ids],
+          `SELECT * FROM products WHERE tenant_id = ?${userFilter} AND ebay_item_id IN (${placeholders})`,
+          [tenantId, ...userFilterParams, ...item_ids],
           (err, rows) => {
             if (err) {
               reject(err);
@@ -1440,8 +1536,8 @@ router.post('/sync/preview', async (req, res) => {
     } else {
       productsToPreview = await new Promise((resolve, reject) => {
         dbInstance.all(
-          'SELECT * FROM products WHERE tenant_id = ?',
-          [tenantId],
+          `SELECT * FROM products WHERE tenant_id = ?${userFilter}`,
+          [tenantId, ...userFilterParams],
           (err, rows) => {
             if (err) {
               reject(err);
@@ -1603,44 +1699,80 @@ router.post('/sync', async (req, res) => {
 });
 
 // Remove products (delete from database)
-router.post('/products/remove', (req, res) => {
+router.post('/products/remove', async (req, res) => {
   const tenantId = getTenantId(req);
   const dbInstance = db.getDb();
-  const { item_ids } = req.body; // Optional array of item IDs to remove
+  const { item_ids, sharetribe_user_id } = req.body; // Optional array of item IDs to remove, and user ID for scoping
+  
+  let sharetribeUserDbId = null;
+  
+  // If user_id is provided, look it up; otherwise allow removing NULL user_id products (legacy)
+  if (sharetribe_user_id) {
+    const sharetribeUser = await new Promise((resolve, reject) => {
+      dbInstance.get(
+        `SELECT id FROM sharetribe_users WHERE id = ? OR sharetribe_user_id = ?`,
+        [sharetribe_user_id, sharetribe_user_id],
+        (err, row) => {
+          if (err) reject(err);
+          else resolve(row);
+        }
+      );
+    });
+    
+    if (!sharetribeUser) {
+      return res.status(400).json({ error: `ShareTribe user ${sharetribe_user_id} not found` });
+    }
+    
+    sharetribeUserDbId = sharetribeUser.id;
+  }
   
   if (item_ids && Array.isArray(item_ids) && item_ids.length > 0) {
-    // Remove selected products
+    // Remove selected products (scoped to user if provided, otherwise NULL user_id)
     const placeholders = item_ids.map(() => '?').join(',');
-    dbInstance.run(
-      `DELETE FROM products WHERE tenant_id = ? AND ebay_item_id IN (${placeholders})`,
-      [tenantId, ...item_ids],
-      function(err) {
-        if (err) {
-          return res.status(500).json({ error: err.message });
-        }
-        res.json({ 
-          success: true, 
-          message: `Removed ${this.changes} product(s)`,
-          count: this.changes 
-        });
+    let query, params;
+    
+    if (sharetribeUserDbId) {
+      query = `DELETE FROM products WHERE tenant_id = ? AND user_id = ? AND ebay_item_id IN (${placeholders})`;
+      params = [tenantId, sharetribeUserDbId, ...item_ids];
+    } else {
+      // Allow removing products with NULL user_id (legacy products)
+      query = `DELETE FROM products WHERE tenant_id = ? AND user_id IS NULL AND ebay_item_id IN (${placeholders})`;
+      params = [tenantId, ...item_ids];
+    }
+    
+    dbInstance.run(query, params, function(err) {
+      if (err) {
+        return res.status(500).json({ error: err.message });
       }
-    );
+      res.json({ 
+        success: true, 
+        message: `Removed ${this.changes} product(s)`,
+        count: this.changes 
+      });
+    });
   } else {
-    // Remove all products
-    dbInstance.run(
-      `DELETE FROM products WHERE tenant_id = ?`,
-      [tenantId],
-      function(err) {
-        if (err) {
-          return res.status(500).json({ error: err.message });
-        }
-        res.json({ 
-          success: true, 
-          message: `Removed ${this.changes} product(s)`,
-          count: this.changes 
-        });
+    // Remove all products for this user (or NULL user_id if no user provided)
+    let query, params;
+    
+    if (sharetribeUserDbId) {
+      query = `DELETE FROM products WHERE tenant_id = ? AND user_id = ?`;
+      params = [tenantId, sharetribeUserDbId];
+    } else {
+      // Allow removing all products with NULL user_id (legacy products)
+      query = `DELETE FROM products WHERE tenant_id = ? AND user_id IS NULL`;
+      params = [tenantId];
+    }
+    
+    dbInstance.run(query, params, function(err) {
+      if (err) {
+        return res.status(500).json({ error: err.message });
       }
-    );
+      res.json({ 
+        success: true, 
+        message: `Removed ${this.changes} product(s)`,
+        count: this.changes 
+      });
+    });
   }
 });
 

@@ -19,6 +19,14 @@ const init = () => {
         reject(err);
         return;
       }
+      // Enable foreign key constraints
+      db.run('PRAGMA foreign_keys = ON', (pragmaErr) => {
+        if (pragmaErr) {
+          console.warn('Warning: Could not enable foreign keys:', pragmaErr);
+        } else {
+          console.log('Foreign key constraints enabled');
+        }
+      });
       console.log('Connected to SQLite database');
       createTables().then(resolve).catch(reject);
     });
@@ -142,10 +150,101 @@ const createTables = () => {
           created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
           updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
           FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
-          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-          UNIQUE(tenant_id, ebay_item_id)
+          FOREIGN KEY (user_id) REFERENCES sharetribe_users(id) ON DELETE CASCADE,
+          UNIQUE(tenant_id, user_id, ebay_item_id)
         )
       `);
+      
+      // Migration: Fix unique constraint to include user_id for proper user scoping
+      // The old table has UNIQUE(tenant_id, ebay_item_id) which causes conflicts
+      // We need to recreate the table with the new constraint
+      db.all(`PRAGMA table_info(products)`, (err, rows) => {
+        if (!err && rows && Array.isArray(rows) && rows.length > 0) {
+          // Check if old constraint exists by looking for the auto-index
+          db.all(`SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='products' AND name LIKE 'sqlite_autoindex%'`, (indexErr, indexes) => {
+            if (!indexErr && indexes && indexes.length > 0) {
+              // Old constraint exists - need to recreate table
+              console.log('🔄 Migrating products table to fix unique constraint...');
+              
+              // Create backup table with new schema
+              db.run(`
+                CREATE TABLE products_new (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  tenant_id INTEGER NOT NULL,
+                  user_id INTEGER,
+                  ebay_item_id TEXT NOT NULL,
+                  title TEXT,
+                  description TEXT,
+                  price REAL,
+                  currency TEXT,
+                  quantity INTEGER,
+                  images TEXT,
+                  category TEXT,
+                  condition TEXT,
+                  brand TEXT,
+                  sku TEXT,
+                  synced BOOLEAN DEFAULT 0,
+                  sharetribe_listing_id TEXT,
+                  last_synced_at DATETIME,
+                  custom_fields TEXT,
+                  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                  FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+                  FOREIGN KEY (user_id) REFERENCES sharetribe_users(id) ON DELETE CASCADE,
+                  UNIQUE(tenant_id, user_id, ebay_item_id)
+                )
+              `, (createErr) => {
+                if (createErr) {
+                  console.error('❌ Error creating new products table:', createErr);
+                } else {
+                  // Copy data from old table to new table
+                  db.run(`
+                    INSERT INTO products_new 
+                    SELECT * FROM products
+                  `, (copyErr) => {
+                    if (copyErr) {
+                      console.error('❌ Error copying data to new products table:', copyErr);
+                      // Drop backup table on error
+                      db.run(`DROP TABLE IF EXISTS products_new`);
+                    } else {
+                      // Drop old table and rename new table
+                      db.run(`DROP TABLE products`, (dropErr) => {
+                        if (dropErr) {
+                          console.error('❌ Error dropping old products table:', dropErr);
+                          db.run(`DROP TABLE IF EXISTS products_new`);
+                        } else {
+                          db.run(`ALTER TABLE products_new RENAME TO products`, (renameErr) => {
+                            if (renameErr) {
+                              console.error('❌ Error renaming new products table:', renameErr);
+                            } else {
+                              console.log('✅ Successfully migrated products table with new unique constraint');
+                              // Create the unique index
+                              db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_products_tenant_user_item ON products(tenant_id, user_id, ebay_item_id)`, (idxErr) => {
+                                if (!idxErr) {
+                                  console.log('✅ Created unique index for products(tenant_id, user_id, ebay_item_id)');
+                                }
+                              });
+                            }
+                          });
+                        }
+                      });
+                    }
+                  });
+                }
+              });
+            } else {
+              // No old constraint, just create the index
+              db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_products_tenant_user_item ON products(tenant_id, user_id, ebay_item_id)`, (indexErr) => {
+                if (indexErr && !indexErr.message.includes('already exists') && !indexErr.message.includes('duplicate')) {
+                  console.warn('Note: Could not create unique index with user_id:', indexErr.message);
+                } else if (!indexErr) {
+                  console.log('✅ Created unique index for products(tenant_id, user_id, ebay_item_id)');
+                }
+              });
+            }
+          });
+        }
+      });
       
       // Add custom_fields column if it doesn't exist (migration)
       // SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so we check first
