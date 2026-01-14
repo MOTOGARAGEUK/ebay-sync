@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { X, CheckCircle, AlertCircle, Loader } from 'lucide-react';
 
 // Format seconds as MM:SS
@@ -192,8 +192,33 @@ const SyncProgressModal = ({ jobId, onClose, onRetryFailed }) => {
   const isCancelled = effectiveState === 'CANCELLED';
   const isAlreadyRunningError = (effectiveState === 'FAILED' || status === 'error') && currentStep && currentStep.includes('already in progress');
   const isError = (effectiveState === 'FAILED' || status === 'error') && !isAlreadyRunningError;
-  const isPaused = effectiveState === 'PAUSED' || effectiveState === 'PAUSED_RATE_LIMIT' || status === 'retry_scheduled';
-  const isRunning = effectiveState === 'RUNNING' || status === 'in_progress' || status === 'starting';
+  
+  // Check if updatedAt is fresh (<5s) for RUNNING state
+  const now = Date.now();
+  const updatedAtMs = updatedAt ? (typeof updatedAt === 'number' ? updatedAt : new Date(updatedAt).getTime()) : 0;
+  const isUpdatedAtFresh = (now - updatedAtMs) < 5000; // Fresh if updated within 5 seconds
+  
+  // Track if processed increased recently (compare with previous value)
+  const lastProcessedRef = useRef(processed);
+  const processedIncreased = processed > lastProcessedRef.current;
+  
+  // Update lastProcessedRef when processed changes
+  useEffect(() => {
+    if (processed > lastProcessedRef.current) {
+      lastProcessedRef.current = processed;
+    }
+  }, [processed]);
+  
+  // Determine if we should show RUNNING UI:
+  // Only if RUNNING state AND (updatedAt is fresh OR processed increased)
+  const shouldShowRunning = (effectiveState === 'RUNNING' || status === 'in_progress' || status === 'starting') && 
+                            (isUpdatedAtFresh || processedIncreased);
+  
+  // Determine paused state: ONLY PAUSED_RATE_LIMIT (actual rate limit), not proactive pacing
+  // Proactive pacing should show RUNNING state (blue progress UI)
+  const isPaused = effectiveState === 'PAUSED_RATE_LIMIT';
+  
+  const isRunning = shouldShowRunning;
   const isInProgress = isRunning || isAlreadyRunningError;
   
   // Calculate percent from processed/total (not completed/total)
@@ -206,26 +231,30 @@ const SyncProgressModal = ({ jobId, onClose, onRetryFailed }) => {
   
   // Calculate resumeAt for countdown (always show countdown when PAUSED)
   const resumeAt = retryAt || nextRetryAt;
-  const now = Date.now();
   const resumeAtMs = resumeAt ? (typeof resumeAt === 'number' ? resumeAt : new Date(resumeAt).getTime()) : null;
+  
+  // If RUNNING but not fresh, treat as PAUSED and set resumeAt to now + 2s
+  const effectiveResumeAt = isPaused && !resumeAtMs && !shouldShowRunning 
+    ? now + 2000 
+    : resumeAtMs;
 
-  // Countdown timer effect for rate limit - MUST be called before any conditional returns
+  // Countdown timer effect for rate limit - ONLY for PAUSED_RATE_LIMIT (actual rate limit)
   useEffect(() => {
     if (!progress) {
       setCountdown(null);
       return;
     }
 
-    // Always show countdown when PAUSED and have resumeAt
-    if (!isPaused || !resumeAtMs) {
+    // Only show countdown when PAUSED_RATE_LIMIT (actual rate limit), not proactive pacing
+    if (!isPaused || !effectiveResumeAt) {
       setCountdown(null);
       return;
     }
 
-    // Use resumeAt to calculate countdown
+    // Use effectiveResumeAt to calculate countdown
     const updateCountdown = async () => {
       const now = Date.now();
-      const msRemaining = resumeAtMs - now;
+      const msRemaining = effectiveResumeAt - now;
       const secondsRemaining = Math.ceil(msRemaining / 1000);
       
       if (secondsRemaining > 0) {
@@ -238,12 +267,12 @@ const SyncProgressModal = ({ jobId, onClose, onRetryFailed }) => {
             const data = await response.json();
             const newState = data.state || data.status;
             
-            // If still PAUSED, backend will provide new resumeAt - continue countdown
+            // If still PAUSED_RATE_LIMIT, backend will provide new resumeAt - continue countdown
             // If RUNNING, update progress and countdown will clear
             setProgress(data);
             
-            // If still PAUSED but no resumeAt, set a short resumeAt (2s) to continue countdown
-            if (newState === 'PAUSED' && !data.retryAt && !data.nextRetryAt) {
+            // If still PAUSED_RATE_LIMIT but no resumeAt, set a short resumeAt (2s) to continue countdown
+            if (newState === 'PAUSED_RATE_LIMIT' && !data.retryAt && !data.nextRetryAt) {
               const newResumeAt = Date.now() + 2000;
               setProgress({
                 ...data,
@@ -272,7 +301,7 @@ const SyncProgressModal = ({ jobId, onClose, onRetryFailed }) => {
     const interval = setInterval(updateCountdown, 1000);
 
     return () => clearInterval(interval);
-  }, [progress, isPaused, resumeAtMs, jobId]);
+  }, [progress, isPaused, effectiveResumeAt, jobId, shouldShowRunning]);
 
   // Don't render modal until we have a jobId
   if (!jobId) {
@@ -304,7 +333,7 @@ const SyncProgressModal = ({ jobId, onClose, onRetryFailed }) => {
         {/* Header */}
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-xl font-semibold text-gray-900">
-            {isCompleted ? 'Sync Completed' : isCancelled ? 'Sync Cancelled' : isError ? 'Sync Error' : isPaused ? 'Sync Paused' : 'Syncing Products'}
+            {isCompleted ? 'Sync Completed' : isCancelled ? 'Sync Cancelled' : isError ? 'Sync Error' : isPaused ? 'Sync Paused (Rate Limit)' : 'Syncing Products'}
           </h2>
           {!isInProgress && (
             <button

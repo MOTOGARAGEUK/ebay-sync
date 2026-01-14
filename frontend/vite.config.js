@@ -20,6 +20,12 @@ export default defineConfig({
         target: 'http://localhost:3001',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/auth\/accepted/, '/api/auth/accepted')
+      },
+      // Proxy backend admin panel
+      '/admin': {
+        target: 'http://localhost:3001',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/admin/, '')
       }
     }
   },

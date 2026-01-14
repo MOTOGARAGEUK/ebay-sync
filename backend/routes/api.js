@@ -9,6 +9,65 @@ const eBayService = require('../services/ebayService');
 const eBayOAuthService = require('../services/ebayOAuthService');
 const ShareTribeService = require('../services/sharetribeService');
 const csvService = require('../services/csvService');
+const syncEventLogger = require('../services/syncEventLogger');
+const rateLimiter = require('../utils/sharetribeRateLimiter');
+
+// ========== Request Storm Protection ==========
+
+// In-flight request tracking for debouncing
+const inFlightStatusRequests = new Map(); // jobId -> Promise
+
+// Status cache (500-1000ms TTL)
+const statusCache = new Map(); // jobId -> { data, expiresAt }
+
+// Simple rate limiter for admin endpoints (per IP)
+const adminRateLimitMap = new Map(); // ip -> { count, resetAt }
+const ADMIN_RATE_LIMIT_WINDOW = 1000; // 1 second
+const ADMIN_RATE_LIMIT_MAX = 1; // max 1 request per second
+
+function getClientIP(req) {
+  return req.ip || 
+         req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 
+         req.headers['x-real-ip'] || 
+         req.connection?.remoteAddress || 
+         'unknown';
+}
+
+function checkAdminRateLimit(req, res, next) {
+  const ip = getClientIP(req);
+  const now = Date.now();
+  
+  let limit = adminRateLimitMap.get(ip);
+  
+  if (!limit || now > limit.resetAt) {
+    // Reset window
+    limit = { count: 1, resetAt: now + ADMIN_RATE_LIMIT_WINDOW };
+    adminRateLimitMap.set(ip, limit);
+    return next();
+  }
+  
+  if (limit.count >= ADMIN_RATE_LIMIT_MAX) {
+    // Rate limited
+    return res.status(429).json({ 
+      error: 'Rate limit exceeded', 
+      message: 'Maximum 1 request per second for admin endpoints' 
+    });
+  }
+  
+  limit.count++;
+  adminRateLimitMap.set(ip, limit);
+  next();
+}
+
+// Clean up old rate limit entries periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, limit] of adminRateLimitMap.entries()) {
+    if (now > limit.resetAt + 60000) { // Keep for 1 minute after expiry
+      adminRateLimitMap.delete(ip);
+    }
+  }
+}, 60000); // Clean every minute
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
@@ -1696,8 +1755,27 @@ router.post('/sync', async (req, res) => {
     console.log(`📋 [API] Created sync job: ${jobId}`);
     
     // Initialize progress IMMEDIATELY so the frontend can start polling
-    // We'll update it with actual product count once sync starts
+    // Note: total will be updated when sync actually starts, but we create the job record now
     try {
+      const now = Date.now();
+      // Create job record in event logger immediately
+      await syncEventLogger.updateJobProgress(jobId, {
+        state: 'RUNNING',
+        processed: 0,
+        total: 0, // Will be updated when sync starts
+        completed: 0,
+        failed: 0,
+        currentProductId: null,
+        currentStep: 'Initializing sync...',
+        retryAt: null,
+        throttleSettings: {
+          minDelayMs: 1000,
+          concurrency: 100
+        },
+        workspaceId: tenantId,
+        userId: sharetribe_user_id || null
+      });
+      
       syncService.updateSyncProgress(jobId, {
         jobId: jobId,
         total: 0, // Will be updated when sync starts
@@ -1705,9 +1783,12 @@ router.post('/sync', async (req, res) => {
         failed: 0,
         percent: 0,
         status: 'starting',
+        state: 'RUNNING',
         currentStep: 'Initializing sync...',
         eta: null,
-        errors: []
+        errors: [],
+        workspaceId: tenantId,
+        userId: sharetribe_user_id || null
       });
       console.log(`📋 [API] Progress initialized for job ${jobId}`);
     } catch (progressError) {
@@ -3499,6 +3580,427 @@ router.delete('/ebay-users/:id', async (req, res) => {
     res.json({ success: true, message: 'eBay user disconnected' });
   } catch (error) {
     console.error('Error disconnecting eBay user:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========== Live Sync Admin Endpoints ==========
+
+// Get current job status (ultra-lightweight, <150ms) - reads from persisted job record
+// WITH DEBOUNCING AND CACHING to prevent request storms
+router.get('/admin/sync/jobs/:jobId/status', checkAdminRateLimit, async (req, res) => {
+  const startTime = Date.now();
+  try {
+    const { jobId } = req.params;
+    
+    // Check cache first (500-1000ms TTL)
+    const cached = statusCache.get(jobId);
+    if (cached && Date.now() < cached.expiresAt) {
+      const duration = Date.now() - startTime;
+      if (duration > 50) {
+        console.warn(`⚠️ [Status Endpoint] Cache hit but slow: ${duration}ms for job ${jobId}`);
+      }
+      return res.json(cached.data);
+    }
+    
+    // Check if request is already in-flight (debouncing)
+    const inFlight = inFlightStatusRequests.get(jobId);
+    if (inFlight) {
+      // Wait for existing request and return its result
+      try {
+        const data = await inFlight;
+        return res.json(data);
+      } catch (err) {
+        // If existing request failed, continue to new request
+        inFlightStatusRequests.delete(jobId);
+      }
+    }
+    
+    // Create new request promise
+    const statusPromise = (async () => {
+      try {
+        // Always read from database first (single source of truth)
+        let snapshot = await syncEventLogger.getJobSnapshotFromDB(jobId);
+        
+        // If not in DB, try cache (for very recent jobs)
+        if (!snapshot) {
+          snapshot = syncEventLogger.getJobSnapshot(jobId);
+        }
+        
+        // If still not found, try syncService progress (backward compatibility)
+        if (!snapshot) {
+          const progress = syncService.getSyncProgress(jobId);
+          if (progress) {
+            // Convert progress to snapshot format
+            snapshot = {
+              job_id: jobId,
+              state: progress.state || 'UNKNOWN',
+              processed: progress.processed || 0,
+              total: progress.total || 0,
+              completed: progress.completed || 0,
+              failed: progress.failed || 0,
+              current_product_id: progress.currentProductId || null,
+              current_step: progress.currentStep || null,
+              retry_at: progress.retryAt || null,
+              last_event_at: progress.lastUpdatedAt || progress.updatedAt || null,
+              updated_at: progress.updatedAt || progress.lastUpdatedAt || Date.now(),
+              total_requests: 0,
+              requests_last60s: 0,
+              error429_count: 0,
+              avg_latency_ms: 0,
+              throttle_min_delay_ms: 1000,
+              throttle_concurrency: 100,
+              last_retry_after: null,
+              stall_detected: 0
+            };
+          }
+        }
+        
+        if (!snapshot) {
+          throw new Error('Sync job not found');
+        }
+        
+        // Update cache for next time
+        syncEventLogger.jobSnapshots.set(jobId, snapshot);
+        
+        // Return lightweight snapshot (always from persisted record)
+        const processed = snapshot.processed !== null && snapshot.processed !== undefined ? snapshot.processed : ((snapshot.completed || 0) + (snapshot.failed || 0));
+        const total = snapshot.total || 0;
+        
+        const response = {
+          jobId: snapshot.job_id,
+          state: snapshot.state || 'UNKNOWN',
+          processed: processed,
+          total: total,
+          completed: snapshot.completed || 0,
+          failed: snapshot.failed || 0,
+          remaining: Math.max(0, total - processed),
+          percent: total > 0 ? Math.round((processed / total) * 100) : 0,
+          currentProduct: snapshot.current_product_id || null,
+          currentStep: snapshot.current_step || null,
+          retryAt: snapshot.retry_at || null,
+          lastEventAt: snapshot.last_event_at || null,
+          updatedAt: snapshot.updated_at || null,
+          throttleSettings: {
+            minDelayMs: snapshot.throttle_min_delay_ms || 1000,
+            concurrency: snapshot.throttle_concurrency || 100
+          },
+          requestCounters: {
+            last60s: snapshot.requests_last60s || 0,
+            total: snapshot.total_requests || 0,
+            error429Count: snapshot.error429_count || 0,
+            avgLatencyMs: snapshot.avg_latency_ms || 0,
+            lastRetryAfter: snapshot.last_retry_after || null
+          },
+          stallDetected: snapshot.stall_detected === 1
+        };
+        
+        // Cache response (750ms TTL - between 500-1000ms)
+        statusCache.set(jobId, {
+          data: response,
+          expiresAt: Date.now() + 750
+        });
+        
+        // Clean up old cache entries periodically
+        if (statusCache.size > 100) {
+          const now = Date.now();
+          for (const [jid, cached] of statusCache.entries()) {
+            if (now > cached.expiresAt) {
+              statusCache.delete(jid);
+            }
+          }
+        }
+        
+        return response;
+      } finally {
+        // Remove from in-flight map
+        inFlightStatusRequests.delete(jobId);
+      }
+    })();
+    
+    // Store promise for debouncing
+    inFlightStatusRequests.set(jobId, statusPromise);
+    
+    // Wait for result
+    const response = await statusPromise;
+    
+    const duration = Date.now() - startTime;
+    if (duration > 150) {
+      console.warn(`⚠️ [Status Endpoint] Slow response: ${duration}ms for job ${jobId}`);
+    }
+    
+    res.json(response);
+  } catch (error) {
+    // Remove from in-flight map on error
+    inFlightStatusRequests.delete(req.params.jobId);
+    console.error('Error getting sync job status:', error);
+    res.status(error.message === 'Sync job not found' ? 404 : 500).json({ error: error.message });
+  }
+});
+
+// Get recent log events (paginated, from database)
+router.get('/admin/sync/jobs/:jobId/events', checkAdminRateLimit, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const limit = parseInt(req.query.limit) || 200;
+    const cursor = req.query.cursor || null;
+    
+    const result = await syncEventLogger.getEvents(jobId, limit, cursor);
+    res.json(result);
+  } catch (error) {
+    console.error('Error getting sync events:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Live streaming events (SSE) - Real SSE endpoint
+// INCLUDES STATUS IN PAYLOAD to avoid separate /status fetches
+router.get('/admin/sync/jobs/:jobId/events/stream', checkAdminRateLimit, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    
+    // Set proper SSE headers (no compression, no buffering)
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    
+    // Disable compression for this response
+    res.removeHeader('Content-Encoding');
+    
+    // Flush headers immediately
+    res.flushHeaders();
+    
+    // Helper to get status snapshot (lightweight)
+    const getStatusSnapshot = async () => {
+      try {
+        let snapshot = await syncEventLogger.getJobSnapshotFromDB(jobId);
+        if (!snapshot) {
+          snapshot = syncEventLogger.getJobSnapshot(jobId);
+        }
+        if (!snapshot) {
+          const progress = syncService.getSyncProgress(jobId);
+          if (progress) {
+            snapshot = {
+              job_id: jobId,
+              state: progress.state || 'UNKNOWN',
+              processed: progress.processed || 0,
+              total: progress.total || 0,
+              completed: progress.completed || 0,
+              failed: progress.failed || 0,
+              current_product_id: progress.currentProductId || null,
+              current_step: progress.currentStep || null,
+              retry_at: progress.retryAt || null,
+              last_event_at: progress.lastUpdatedAt || progress.updatedAt || null,
+              updated_at: progress.updatedAt || progress.lastUpdatedAt || Date.now(),
+              total_requests: 0,
+              requests_last60s: 0,
+              error429_count: 0,
+              avg_latency_ms: 0,
+              throttle_min_delay_ms: 1000,
+              throttle_concurrency: 100,
+              last_retry_after: null,
+              stall_detected: 0
+            };
+          }
+        }
+        if (!snapshot) return null;
+        
+        const processed = snapshot.processed !== null && snapshot.processed !== undefined ? snapshot.processed : ((snapshot.completed || 0) + (snapshot.failed || 0));
+        const total = snapshot.total || 0;
+        
+        return {
+          jobId: snapshot.job_id,
+          state: snapshot.state || 'UNKNOWN',
+          processed: processed,
+          total: total,
+          completed: snapshot.completed || 0,
+          failed: snapshot.failed || 0,
+          remaining: Math.max(0, total - processed),
+          percent: total > 0 ? Math.round((processed / total) * 100) : 0,
+          currentProduct: snapshot.current_product_id || null,
+          currentStep: snapshot.current_step || null,
+          retryAt: snapshot.retry_at || null,
+          lastEventAt: snapshot.last_event_at || null,
+          updatedAt: snapshot.updated_at || null,
+          throttleSettings: {
+            minDelayMs: snapshot.throttle_min_delay_ms || 1000,
+            concurrency: snapshot.throttle_concurrency || 100
+          },
+          requestCounters: {
+            last60s: snapshot.requests_last60s || 0,
+            total: snapshot.total_requests || 0,
+            error429Count: snapshot.error429_count || 0,
+            avgLatencyMs: snapshot.avg_latency_ms || 0,
+            lastRetryAfter: snapshot.last_retry_after || null
+          },
+          stallDetected: snapshot.stall_detected === 1
+        };
+      } catch (err) {
+        console.error('Error getting status snapshot in SSE:', err);
+        return null;
+      }
+    };
+    
+    // Send initial connection message with status
+    const initialStatus = await getStatusSnapshot();
+    res.write(`data: ${JSON.stringify({ type: 'connected', jobId: jobId, status: initialStatus })}\n\n`);
+    if (res.flush) res.flush();
+    
+    // Track last event timestamp to only send new events
+    let lastEventTimestampMs = null;
+    let lastHeartbeat = Date.now();
+    let lastStatusUpdate = Date.now();
+    
+    // Function to send event
+    const sendEvent = (event) => {
+      try {
+        res.write(`data: ${JSON.stringify(event)}\n\n`);
+        if (res.flush) res.flush();
+      } catch (err) {
+        console.error('Error writing SSE event:', err);
+      }
+    };
+    
+    // Poll for new events from database
+    const pollInterval = setInterval(async () => {
+      try {
+        // Check if client disconnected
+        if (req.aborted || res.destroyed) {
+          clearInterval(pollInterval);
+          return;
+        }
+        
+        // Get new events from database
+        const eventsResult = await syncEventLogger.getEvents(jobId, 50, lastEventTimestampMs);
+        const newEvents = eventsResult.events || [];
+        
+        if (newEvents.length > 0) {
+          // Update last timestamp
+          lastEventTimestampMs = Math.max(...newEvents.map(e => e.timestampMs));
+          
+          // Send each new event WITH STATUS (every 3-5 seconds)
+          const now = Date.now();
+          const includeStatus = (now - lastStatusUpdate) >= 3000; // Include status every 3 seconds
+          
+          if (includeStatus) {
+            const status = await getStatusSnapshot();
+            newEvents.forEach(event => {
+              sendEvent({ type: 'event', event: event, status: status });
+            });
+            lastStatusUpdate = now;
+          } else {
+            newEvents.forEach(event => {
+              sendEvent({ type: 'event', event: event });
+            });
+          }
+        }
+        
+        // Send heartbeat with status every 15 seconds
+        const now = Date.now();
+        if (now - lastHeartbeat >= 15000) {
+          const status = await getStatusSnapshot();
+          sendEvent({ type: 'ping', timestamp: new Date().toISOString(), status: status });
+          lastHeartbeat = now;
+          lastStatusUpdate = now;
+        }
+      } catch (error) {
+        console.error('Error in SSE stream:', error);
+        sendEvent({ type: 'error', error: error.message });
+      }
+    }, 500); // Poll every 500ms
+    
+    // Clean up on client disconnect
+    req.on('close', () => {
+      clearInterval(pollInterval);
+      if (!res.destroyed) {
+        res.end();
+      }
+    });
+    
+    req.on('aborted', () => {
+      clearInterval(pollInterval);
+      if (!res.destroyed) {
+        res.end();
+      }
+    });
+  } catch (error) {
+    console.error('Error setting up SSE stream:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+});
+
+// Get all active job IDs
+router.get('/admin/sync/jobs', checkAdminRateLimit, async (req, res) => {
+  try {
+    const activeJobIds = await syncEventLogger.getActiveJobIds();
+    const jobs = await Promise.all(activeJobIds.map(async (jobId) => {
+      const snapshot = syncEventLogger.getJobSnapshot(jobId) || await syncEventLogger.getJobSnapshotFromDB(jobId);
+      return {
+        jobId: jobId,
+        state: snapshot?.state || 'UNKNOWN',
+        processed: snapshot?.processed || 0,
+        total: snapshot?.total || 0,
+        lastEventTimestamp: snapshot?.last_event_at || null
+      };
+    }));
+    
+    res.json({ jobs: jobs });
+  } catch (error) {
+    console.error('Error getting active jobs:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Debug endpoint: last 20 events + key counters
+router.get('/admin/sync/jobs/:jobId/debug', checkAdminRateLimit, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    
+    // Get snapshot
+    let snapshot = syncEventLogger.getJobSnapshot(jobId);
+    if (!snapshot) {
+      snapshot = await syncEventLogger.getJobSnapshotFromDB(jobId);
+    }
+    
+    if (!snapshot) {
+      return res.status(404).json({ error: 'Sync job not found' });
+    }
+    
+    // Get last 20 events
+    const eventsResult = await syncEventLogger.getEvents(jobId, 20);
+    
+    res.json({
+      snapshot: {
+        jobId: snapshot.job_id,
+        state: snapshot.state,
+        processed: snapshot.processed,
+        total: snapshot.total,
+        currentProduct: snapshot.current_product_id,
+        currentStep: snapshot.current_step,
+        retryAt: snapshot.retry_at,
+        lastEventAt: snapshot.last_event_at,
+        updatedAt: snapshot.updated_at,
+        stallDetected: snapshot.stall_detected === 1
+      },
+      counters: {
+        totalRequests: snapshot.total_requests || 0,
+        requestsLast60s: snapshot.requests_last60s || 0,
+        error429Count: snapshot.error429_count || 0,
+        avgLatencyMs: snapshot.avg_latency_ms || 0,
+        lastRetryAfter: snapshot.last_retry_after || null
+      },
+      throttleSettings: {
+        minDelayMs: snapshot.throttle_min_delay_ms || 1000,
+        concurrency: snapshot.throttle_concurrency || 100
+      },
+      recentEvents: eventsResult.events || []
+    });
+  } catch (error) {
+    console.error('Error getting debug info:', error);
     res.status(500).json({ error: error.message });
   }
 });

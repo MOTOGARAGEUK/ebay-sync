@@ -181,6 +181,7 @@ app.get('/', (req, res) => {
       <a href="/products" onclick="loadPage('products'); return false;">Products</a>
       <a href="/api-data" onclick="loadPage('api-data'); return false;">API Data</a>
       <a href="/asset-delivery" onclick="loadPage('asset-delivery'); return false;">Asset Delivery API</a>
+      <a href="/live-sync" onclick="loadPage('live-sync'); return false;">Live Sync</a>
     </nav>
     
     <div class="content" id="content">
@@ -264,6 +265,76 @@ app.get('/', (req, res) => {
           </div>
         \`;
         loadAssetDeliveryApi();
+      } else if (page === 'live-sync') {
+        content.innerHTML = \`
+          <h2>🔍 Live Sync Inspector</h2>
+          <div style="margin-bottom: 20px;">
+            <label style="margin-right: 15px;">
+              <strong>Select Job:</strong>
+              <select id="job-select" onchange="selectJob()" style="padding: 5px 10px; margin-left: 10px; border-radius: 4px; border: 1px solid #d1d5db;">
+                <option value="">-- Select a sync job --</option>
+              </select>
+            </label>
+            <button class="refresh-btn" onclick="refreshJobList()" style="margin-left: 10px;">🔄 Refresh Jobs</button>
+          </div>
+          
+          <div id="job-summary" style="display: none; background: #f9fafb; padding: 15px; border-radius: 5px; margin-bottom: 20px; border-left: 4px solid #2563eb;">
+            <div class="stats" style="grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));">
+              <div class="stat-card" style="border-left-color: #10b981;">
+                <div class="stat-label">Status</div>
+                <div class="stat-value" id="job-status" style="font-size: 18px;">-</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">Products</div>
+                <div class="stat-value" id="job-products">-</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">Requests (60s)</div>
+                <div class="stat-value" id="job-requests-60s">-</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">Total Requests</div>
+                <div class="stat-value" id="job-total-requests">-</div>
+              </div>
+              <div class="stat-card" style="border-left-color: #ef4444;">
+                <div class="stat-label">429 Errors</div>
+                <div class="stat-value" id="job-429-count">-</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">Avg Latency</div>
+                <div class="stat-value" id="job-avg-latency">-</div>
+              </div>
+            </div>
+            <div style="margin-top: 15px; font-size: 12px; color: #6b7280;">
+              <div>Throttle: <span id="job-throttle">-</span></div>
+              <div>Last Event: <span id="job-last-event">-</span></div>
+            </div>
+          </div>
+          
+          <div style="margin-bottom: 15px;">
+            <label style="margin-right: 15px;">
+              <strong>Filters:</strong>
+              <select id="status-filter" onchange="applyFilters()" style="padding: 5px 10px; margin-left: 10px; border-radius: 4px; border: 1px solid #d1d5db;">
+                <option value="all">All Status</option>
+                <option value="2xx">2xx Success</option>
+                <option value="4xx">4xx Errors</option>
+                <option value="429">429 Rate Limit</option>
+              </select>
+            </label>
+            <label style="margin-right: 15px;">
+              <input type="text" id="product-filter" placeholder="Product ID/SKU" onkeyup="applyFilters()" style="padding: 5px 10px; margin-left: 10px; border-radius: 4px; border: 1px solid #d1d5db; width: 200px;">
+            </label>
+            <label>
+              <input type="checkbox" id="errors-only" onchange="applyFilters()" style="margin-left: 10px;">
+              Errors Only
+            </label>
+          </div>
+          
+          <div id="live-sync-container">
+            <div class="loading">Select a sync job to view live events...</div>
+          </div>
+        \`;
+        refreshJobList();
       }
     }
     
@@ -519,6 +590,238 @@ app.get('/', (req, res) => {
       const div = document.createElement('div');
       div.textContent = text;
       return div.innerHTML;
+    }
+    
+    let currentJobId = null;
+    let eventStream = null;
+    let allEvents = [];
+    let filteredEvents = [];
+    
+    async function refreshJobList() {
+      try {
+        const res = await fetch('/api/admin/sync/jobs');
+        const data = await res.json();
+        const select = document.getElementById('job-select');
+        
+        select.innerHTML = '<option value="">-- Select a sync job --</option>';
+        data.jobs.forEach(job => {
+          const option = document.createElement('option');
+          option.value = job.jobId;
+          option.textContent = \`Job \${job.jobId} (\${job.state}) - \${job.processed}/\${job.total}\`;
+          select.appendChild(option);
+        });
+      } catch (e) {
+        console.error('Error loading jobs:', e);
+      }
+    }
+    
+    async function selectJob() {
+      const select = document.getElementById('job-select');
+      const jobId = select.value;
+      
+      if (!jobId) {
+        currentJobId = null;
+        if (eventStream) {
+          eventStream.close();
+          eventStream = null;
+        }
+        document.getElementById('job-summary').style.display = 'none';
+        document.getElementById('live-sync-container').innerHTML = '<div class="loading">Select a sync job to view live events...</div>';
+        return;
+      }
+      
+      currentJobId = jobId;
+      allEvents = [];
+      filteredEvents = [];
+      
+      // Load initial events
+      await loadJobStatus();
+      await loadJobEvents();
+      
+      // Start SSE stream
+      startEventStream();
+    }
+    
+    // Throttle status updates to once every 4 seconds
+    let lastStatusUpdate = 0;
+    const STATUS_UPDATE_THROTTLE = 4000; // 4 seconds
+    
+    function updateJobStatusUI(data) {
+      if (!data) return;
+      
+      document.getElementById('job-summary').style.display = 'block';
+      document.getElementById('job-status').textContent = data.state || '-';
+      document.getElementById('job-status').style.color = data.state === 'RUNNING' ? '#10b981' : data.state === 'PAUSED' ? '#f59e0b' : data.state === 'COMPLETED' ? '#2563eb' : '#ef4444';
+      document.getElementById('job-products').textContent = \`\${data.processed || 0}/\${data.total || 0}\`;
+      document.getElementById('job-requests-60s').textContent = data.requestCounters?.last60s || 0;
+      document.getElementById('job-total-requests').textContent = data.requestCounters?.total || 0;
+      document.getElementById('job-429-count').textContent = data.requestCounters?.error429Count || 0;
+      document.getElementById('job-avg-latency').textContent = \`\${data.requestCounters?.avgLatencyMs || 0}ms\`;
+      document.getElementById('job-throttle').textContent = \`delay=\${data.throttleSettings?.minDelayMs || 0}ms, concurrency=\${data.throttleSettings?.concurrency || 100}\`;
+      document.getElementById('job-last-event').textContent = data.lastEventAt ? new Date(data.lastEventAt).toLocaleString() : '-';
+    }
+    
+    async function loadJobStatus() {
+      if (!currentJobId) return;
+      
+      const now = Date.now();
+      if (now - lastStatusUpdate < STATUS_UPDATE_THROTTLE) {
+        return; // Throttled - skip this request
+      }
+      lastStatusUpdate = now;
+      
+      try {
+        const res = await fetch(\`/api/admin/sync/jobs/\${currentJobId}/status\`);
+        const data = await res.json();
+        updateJobStatusUI(data);
+      } catch (e) {
+        console.error('Error loading job status:', e);
+      }
+    }
+    
+    async function loadJobEvents() {
+      if (!currentJobId) return;
+      
+      try {
+        const res = await fetch(\`/api/admin/sync/jobs/\${currentJobId}/events?limit=500\`);
+        const data = await res.json();
+        
+        allEvents = data.events || [];
+        applyFilters();
+        
+        // Refresh status
+        await loadJobStatus();
+      } catch (e) {
+        console.error('Error loading events:', e);
+        document.getElementById('live-sync-container').innerHTML = '<div class="log-error">Error loading events: ' + e.message + '</div>';
+      }
+    }
+    
+    function startEventStream() {
+      if (!currentJobId) return;
+      
+      // Close existing stream
+      if (eventStream) {
+        eventStream.close();
+      }
+      
+      const eventSource = new EventSource(\`/api/admin/sync/jobs/\${currentJobId}/events/stream\`);
+      
+      eventSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        
+        if (data.type === 'connected') {
+          // Initial connection - update status from payload
+          if (data.status) {
+            updateJobStatusUI(data.status);
+          }
+        } else if (data.type === 'event') {
+          // Add new event
+          allEvents.unshift(data.event);
+          // Keep only last 2000 events
+          if (allEvents.length > 2000) {
+            allEvents = allEvents.slice(0, 2000);
+          }
+          
+          applyFilters();
+          
+          // Update status from SSE payload if included (every 3 seconds)
+          if (data.status) {
+            updateJobStatusUI(data.status);
+          }
+        } else if (data.type === 'ping') {
+          // Heartbeat - update status from payload (every 15 seconds)
+          if (data.status) {
+            updateJobStatusUI(data.status);
+          }
+        }
+      };
+      
+      eventSource.onerror = (error) => {
+        console.error('SSE error:', error);
+        // Try to reconnect after 2 seconds
+        setTimeout(() => {
+          if (currentJobId) {
+            startEventStream();
+          }
+        }, 2000);
+      };
+      
+      eventStream = eventSource;
+    }
+    
+    function applyFilters() {
+      if (!currentJobId) return;
+      
+      const statusFilter = document.getElementById('status-filter')?.value || 'all';
+      const productFilter = document.getElementById('product-filter')?.value?.toLowerCase() || '';
+      const errorsOnly = document.getElementById('errors-only')?.checked || false;
+      
+      filteredEvents = allEvents.filter(event => {
+        // Status filter
+        if (statusFilter === '2xx' && (!event.statusCode || event.statusCode < 200 || event.statusCode >= 300)) return false;
+        if (statusFilter === '4xx' && (!event.statusCode || event.statusCode < 400 || event.statusCode >= 500)) return false;
+        if (statusFilter === '429' && event.statusCode !== 429) return false;
+        
+        // Product filter
+        if (productFilter && !event.productId?.toLowerCase().includes(productFilter) && !event.listingId?.toLowerCase().includes(productFilter)) return false;
+        
+        // Errors only
+        if (errorsOnly && (!event.statusCode || event.statusCode < 400)) return false;
+        
+        return true;
+      });
+      
+      renderEvents();
+    }
+    
+    function renderEvents() {
+      const container = document.getElementById('live-sync-container');
+      
+      if (filteredEvents.length === 0) {
+        container.innerHTML = '<div class="loading">No events match the current filters.</div>';
+        return;
+      }
+      
+      let html = '<table><thead><tr>';
+      html += '<th>Time</th>';
+      html += '<th>Product / Listing</th>';
+      html += '<th>Operation</th>';
+      html += '<th>Method + Path</th>';
+      html += '<th>Status</th>';
+      html += '<th>Duration</th>';
+      html += '<th>Retry-After</th>';
+      html += '<th>Message</th>';
+      html += '</tr></thead><tbody>';
+      
+      filteredEvents.slice(0, 500).forEach(event => {
+        const statusColor = event.statusCode === 429 ? '#ef4444' : 
+                           event.statusCode >= 400 ? '#f59e0b' : 
+                           event.statusCode >= 200 && event.statusCode < 300 ? '#10b981' : '#6b7280';
+        
+        html += '<tr style="cursor: pointer;" onclick="showEventDetails(' + JSON.stringify(event).replace(/"/g, '&quot;') + ')">';
+        html += '<td>' + new Date(event.timestamp).toLocaleTimeString() + '</td>';
+        html += '<td>' + (event.productId || '-') + '<br><small style="color: #6b7280;">' + (event.listingId || '-') + '</small></td>';
+        html += '<td>' + escapeHtml(event.operation || '-') + '</td>';
+        html += '<td><strong>' + escapeHtml(event.httpMethod || '-') + '</strong><br><small style="color: #6b7280;">' + escapeHtml(event.endpointPath || '-') + '</small></td>';
+        html += '<td style="color: ' + statusColor + '; font-weight: bold;">' + (event.statusCode || 'ERROR') + '</td>';
+        html += '<td>' + (event.durationMs || 0) + 'ms</td>';
+        html += '<td>' + (event.retryAfterSeconds ? event.retryAfterSeconds + 's' : '-') + '</td>';
+        html += '<td>' + escapeHtml((event.errorMessage || event.payloadSummary || '').substring(0, 50)) + '</td>';
+        html += '</tr>';
+      });
+      
+      html += '</tbody></table>';
+      
+      container.innerHTML = html;
+    }
+    
+    function showEventDetails(event) {
+      const details = window.open('', 'Event Details', 'width=800,height=600');
+      details.document.write('<html><head><title>Event Details</title><style>body{font-family:monospace;padding:20px;background:#f5f5f5;}pre{background:#fff;padding:15px;border-radius:5px;overflow:auto;}</style></head><body>');
+      details.document.write('<h2>Event Details</h2>');
+      details.document.write('<pre>' + JSON.stringify(event, null, 2).replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre>');
+      details.document.write('</body></html>');
     }
     
     // Load stats on page load

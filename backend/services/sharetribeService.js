@@ -1,6 +1,7 @@
 const axios = require('axios');
 const responseStore = require('../utils/responseStore');
 const rateLimiter = require('../utils/sharetribeRateLimiter');
+const syncEventLogger = require('./syncEventLogger');
 
 class ShareTribeService {
   constructor(config) {
@@ -34,6 +35,137 @@ class ShareTribeService {
     this.authUrl = 'https://flex-api.sharetribe.com/v1/auth/token';
     this.accessToken = null;
     this.tokenExpiry = null;
+    
+    // Current sync context (set by syncService)
+    this.currentJobId = null;
+    this.currentWorkspaceId = 1;
+    this.currentUserId = null;
+    this.currentProductId = null;
+  }
+  
+  /**
+   * Set current sync context for event logging
+   */
+  setSyncContext(jobId, workspaceId = 1, userId = null, productId = null) {
+    this.currentJobId = jobId;
+    this.currentWorkspaceId = workspaceId;
+    this.currentUserId = userId;
+    this.currentProductId = productId;
+  }
+  
+  /**
+   * Execute request with event logging
+   * Wraps rateLimiter.executeRequest and logs events
+   */
+  async executeRequestWithLogging(axiosRequestFn, endpointType, operation, endpointPath, payloadSummary = null) {
+    const startTime = Date.now();
+    let statusCode = null;
+    let durationMs = 0;
+    let requestId = null;
+    let retryAfterSeconds = null;
+    let rateLimitHeaders = null;
+    let errorCode = null;
+    let errorMessage = null;
+    let responseSnippet = null;
+    let listingId = null;
+    
+    try {
+      // Execute request through rate limiter
+      const response = await rateLimiter.executeRequest(axiosRequestFn, endpointType);
+      
+      durationMs = Date.now() - startTime;
+      statusCode = response.status;
+      requestId = response.headers['x-request-id'] || response.headers['X-Request-Id'] || null;
+      
+      // Extract rate limit headers
+      if (response.headers['retry-after'] || response.headers['Retry-After']) {
+        retryAfterSeconds = parseInt(response.headers['retry-after'] || response.headers['Retry-After']);
+        rateLimitHeaders = {
+          'retry-after': retryAfterSeconds
+        };
+      }
+      
+      // Extract listing ID from response if available
+      if (response.data && response.data.data && response.data.data.id) {
+        listingId = response.data.data.id;
+      }
+      
+      // Create response snippet (first 300-500 chars)
+      if (response.data) {
+        const responseStr = JSON.stringify(response.data);
+        responseSnippet = responseStr.substring(0, Math.min(500, responseStr.length));
+      }
+      
+      // Log event
+      if (this.currentJobId) {
+        syncEventLogger.logEvent(this.currentJobId, {
+          workspaceId: this.currentWorkspaceId,
+          userId: this.currentUserId,
+          productId: this.currentProductId,
+          listingId: listingId,
+          operation: operation,
+          httpMethod: endpointType === 'create' ? 'POST' : endpointType === 'post' ? 'POST' : endpointType === 'get' ? 'GET' : 'DELETE',
+          endpointPath: endpointPath,
+          statusCode: statusCode,
+          durationMs: durationMs,
+          requestId: requestId,
+          retryAfterSeconds: retryAfterSeconds,
+          rateLimitHeaders: rateLimitHeaders,
+          payloadSummary: payloadSummary,
+          responseSnippet: responseSnippet
+        });
+      }
+      
+      return response;
+    } catch (error) {
+      durationMs = Date.now() - startTime;
+      
+      if (error.response) {
+        statusCode = error.response.status;
+        requestId = error.response.headers['x-request-id'] || error.response.headers['X-Request-Id'] || null;
+        
+        // Extract rate limit headers
+        if (error.response.headers['retry-after'] || error.response.headers['Retry-After']) {
+          retryAfterSeconds = parseInt(error.response.headers['retry-after'] || error.response.headers['Retry-After']);
+          rateLimitHeaders = {
+            'retry-after': retryAfterSeconds
+          };
+        }
+        
+        // Create response snippet
+        if (error.response.data) {
+          const responseStr = JSON.stringify(error.response.data);
+          responseSnippet = responseStr.substring(0, Math.min(500, responseStr.length));
+        }
+      }
+      
+      errorCode = error.code || (error.response && error.response.status) || null;
+      errorMessage = error.message || (error.response && error.response.statusText) || 'Unknown error';
+      
+      // Log event
+      if (this.currentJobId) {
+        syncEventLogger.logEvent(this.currentJobId, {
+          workspaceId: this.currentWorkspaceId,
+          userId: this.currentUserId,
+          productId: this.currentProductId,
+          listingId: listingId,
+          operation: operation,
+          httpMethod: endpointType === 'create' ? 'POST' : endpointType === 'post' ? 'POST' : endpointType === 'get' ? 'GET' : 'DELETE',
+          endpointPath: endpointPath,
+          statusCode: statusCode,
+          durationMs: durationMs,
+          requestId: requestId,
+          retryAfterSeconds: retryAfterSeconds,
+          rateLimitHeaders: rateLimitHeaders,
+          errorCode: errorCode,
+          errorMessage: errorMessage.substring(0, 200), // Limit error message length
+          payloadSummary: payloadSummary,
+          responseSnippet: responseSnippet
+        });
+      }
+      
+      throw error;
+    }
   }
 
   // Get OAuth2 access token using Client Credentials grant
@@ -382,8 +514,13 @@ class ShareTribeService {
         console.log('Has images field:', 'images' in listingData);
         console.log('Images field value:', listingData.images);
         
-        // Use rate limiter for PUT request (update listing)
-        const response = await rateLimiter.executeRequest(
+        // Use rate limiter for PUT request (update listing) with event logging
+        const endpointPath = this.isIntegrationAPI 
+          ? `/v1/integration_api/listings/${existingListingId}`
+          : `/v1/marketplaces/${this.marketplaceId}/own_listings/${existingListingId}.json`;
+        const payloadSummary = listingData.title ? `title: "${listingData.title.substring(0, 50)}"` : 'update listing';
+        
+        const response = await this.executeRequestWithLogging(
           () => axios.put(
             apiUrl,
             listingData, // Send the exact object
@@ -398,7 +535,9 @@ class ShareTribeService {
             }
           ),
           'post', // Update is a POST-type operation
-          `update_${existingListingId}`
+          'updateListing',
+          endpointPath,
+          payloadSummary
         );
         
         console.log('=== ShareTribe API Update Response ===');
@@ -527,8 +666,13 @@ class ShareTribeService {
         
         // Send the EXACT payload object - no modifications
         // Include images in response to verify they were attached
-        // Use rate limiter for POST request (create listing)
-        const response = await rateLimiter.executeRequest(
+        // Use rate limiter for POST request (create listing) with event logging
+        const endpointPath = this.isIntegrationAPI 
+          ? '/v1/integration_api/listings/create'
+          : `/v1/marketplaces/${this.marketplaceId}/own_listings.json`;
+        const payloadSummary = listingData.title ? `title: "${listingData.title.substring(0, 50)}"` : 'create listing';
+        
+        const response = await this.executeRequestWithLogging(
           () => axios.post(
             apiUrl,
             listingData, // Send the exact object, not a copy
@@ -543,7 +687,9 @@ class ShareTribeService {
             }
           ),
           'create', // Creating listing uses 'create' endpoint type
-          `create_${productData.ebay_item_id || 'unknown'}`
+          'createListing',
+          endpointPath,
+          payloadSummary
         );
         
         console.log('=== ShareTribe API Create Response ===');
@@ -1482,8 +1628,12 @@ class ShareTribeService {
         apiUrl = `${this.baseUrl}/own_listings/${listingId}.json`;
       }
       
-      // Use rate limiter for GET request
-      const response = await rateLimiter.executeRequest(
+      // Use rate limiter for GET request with event logging
+      const endpointPath = this.isIntegrationAPI 
+        ? `/v1/integration_api/listings/show?id=${listingId}&include=images`
+        : `/v1/marketplaces/${this.marketplaceId}/own_listings/${listingId}.json`;
+      
+      const response = await this.executeRequestWithLogging(
         () => axios.get(
           apiUrl,
           {
@@ -1491,7 +1641,9 @@ class ShareTribeService {
           }
         ),
         'get',
-        `get_listing_${listingId}`
+        'getListing',
+        endpointPath,
+        `get listing: ${listingId}`
       );
       return response.data;
     } catch (error) {
@@ -1511,8 +1663,12 @@ class ShareTribeService {
         apiUrl = `${this.baseUrl}/own_listings/${listingId}.json`;
       }
       
-      // Use rate limiter for DELETE request (POST-type operation)
-      await rateLimiter.executeRequest(
+      // Use rate limiter for DELETE request (POST-type operation) with event logging
+      const endpointPath = this.isIntegrationAPI 
+        ? `/v1/integration_api/listings/${listingId}`
+        : `/v1/marketplaces/${this.marketplaceId}/own_listings/${listingId}.json`;
+      
+      await this.executeRequestWithLogging(
         () => axios.delete(
           apiUrl,
           {
@@ -1520,7 +1676,9 @@ class ShareTribeService {
           }
         ),
         'post',
-        `delete_listing_${listingId}`
+        'deleteListing',
+        endpointPath,
+        `delete listing: ${listingId}`
       );
       return { success: true };
     } catch (error) {
@@ -2465,8 +2623,11 @@ class ShareTribeService {
       
       console.log(`Uploading image to ShareTribe: ${imageName || 'unnamed'}`);
       
-      // Use rate limiter for POST request (upload image)
-      const response = await rateLimiter.executeRequest(
+      // Use rate limiter for POST request (upload image) with event logging
+      const endpointPath = '/v1/integration_api/images/upload';
+      const payloadSummary = `upload image: ${imageName || 'unnamed'} (${Math.round(imageBuffer.length / 1024)}KB)`;
+      
+      const response = await this.executeRequestWithLogging(
         () => axios.post(apiUrl, formData, {
           headers: {
             ...headers,
@@ -2476,7 +2637,9 @@ class ShareTribeService {
           maxBodyLength: Infinity
         }),
         'post',
-        `upload_image_${imageName || 'unnamed'}`
+        'uploadImage',
+        endpointPath,
+        payloadSummary
       );
 
       console.log(`Image upload response status: ${response.status}`);
@@ -2537,8 +2700,10 @@ class ShareTribeService {
       console.log('Using endpoint: GET', apiUrl);
       
       // Integration API uses GET request for /users/query
-      // Use rate limiter for GET request
-      const response = await rateLimiter.executeRequest(
+      // Use rate limiter for GET request with event logging
+      const endpointPath = '/v1/integration_api/users/query';
+      
+      const response = await this.executeRequestWithLogging(
         () => axios.get(
           apiUrl,
           {
@@ -2549,7 +2714,9 @@ class ShareTribeService {
           }
         ),
         'get',
-        'get_all_users'
+        'queryUsers',
+        endpointPath,
+        'query ShareTribe users'
       );
       
       console.log(`Response status: ${response.status}`);

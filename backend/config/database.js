@@ -281,6 +281,66 @@ const createTables = () => {
         )
       `);
 
+      // Sync Jobs table (lightweight snapshot cache)
+      db.run(`
+        CREATE TABLE IF NOT EXISTS sync_jobs (
+          job_id TEXT PRIMARY KEY,
+          tenant_id INTEGER NOT NULL,
+          user_id INTEGER,
+          state TEXT NOT NULL DEFAULT 'RUNNING',
+          processed INTEGER DEFAULT 0,
+          total INTEGER DEFAULT 0,
+          completed INTEGER DEFAULT 0,
+          failed INTEGER DEFAULT 0,
+          current_product_id TEXT,
+          current_step TEXT,
+          retry_at INTEGER,
+          last_event_at INTEGER,
+          updated_at INTEGER NOT NULL,
+          total_requests INTEGER DEFAULT 0,
+          requests_last60s INTEGER DEFAULT 0,
+          error429_count INTEGER DEFAULT 0,
+          avg_latency_ms INTEGER DEFAULT 0,
+          throttle_min_delay_ms INTEGER DEFAULT 1000,
+          throttle_concurrency INTEGER DEFAULT 100,
+          last_retry_after INTEGER,
+          stall_detected INTEGER DEFAULT 0,
+          created_at INTEGER NOT NULL
+        )
+      `);
+
+      // Sync Events table (detailed event log)
+      db.run(`
+        CREATE TABLE IF NOT EXISTS sync_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          job_id TEXT NOT NULL,
+          timestamp_ms INTEGER NOT NULL,
+          timestamp TEXT NOT NULL,
+          workspace_id INTEGER DEFAULT 1,
+          user_id INTEGER,
+          product_id TEXT,
+          listing_id TEXT,
+          operation TEXT NOT NULL,
+          http_method TEXT NOT NULL,
+          endpoint_path TEXT NOT NULL,
+          status_code INTEGER,
+          duration_ms INTEGER DEFAULT 0,
+          request_id TEXT,
+          retry_after_seconds INTEGER,
+          rate_limit_headers TEXT,
+          error_code TEXT,
+          error_message TEXT,
+          payload_summary TEXT,
+          response_snippet TEXT,
+          FOREIGN KEY (job_id) REFERENCES sync_jobs(job_id) ON DELETE CASCADE
+        )
+      `);
+
+      // Indexes for fast queries
+      db.run(`CREATE INDEX IF NOT EXISTS idx_sync_events_job_timestamp ON sync_events(job_id, timestamp_ms DESC)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_sync_events_timestamp ON sync_events(timestamp_ms DESC)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_sync_jobs_updated ON sync_jobs(updated_at DESC)`);
+
       // Migrations for existing databases
       db.run(`ALTER TABLE api_config ADD COLUMN sharetribe_user_id TEXT`, (err) => {
         if (err && !err.message.includes('duplicate column') && !err.message.includes('no such column')) {
