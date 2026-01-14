@@ -1685,83 +1685,137 @@ class ShareTribeService {
         return [];
       }
       
-      // Asset Delivery API endpoint format: https://cdn.st-api.com/v1/assets/pub/[CLIENT_ID]/listings/listing-types.json
-      // Try both with and without marketplace ID, and try different aliases
-      const assetDeliveryEndpoints = [
-        `https://cdn.st-api.com/v1/assets/pub/${this.marketplaceApiClientId}/listings/listing-types.json`,
-        `https://cdn.st-api.com/v1/assets/pub/${this.marketplaceApiClientId}/latest/listings/listing-types.json`,
-        `https://cdn.st-api.com/v1/assets/pub/${this.marketplaceApiClientId}/${this.marketplaceId}/listings/listing-types.json`
-      ];
+      // Asset Delivery API endpoint format (official):
+      // GET https://cdn.st-api.com/v1/assets/pub/<SHARETRIBE_CLIENT_ID>/a/latest/listings/listing-types.json
+      // Where <SHARETRIBE_CLIENT_ID> is the Marketplace API application clientId
+      const assetDeliveryEndpoint = `https://cdn.st-api.com/v1/assets/pub/${this.marketplaceApiClientId}/a/latest/listings/listing-types.json`;
       
-      for (const endpoint of assetDeliveryEndpoints) {
-        try {
-          console.log(`Trying Asset Delivery API for listing types: ${endpoint}`);
-          // Asset Delivery API uses Marketplace API client ID (no secret needed for read-only)
-          const response = await axios.get(endpoint, {
-            headers: {
-              'Accept': 'application/json'
-            },
-            validateStatus: function (status) {
-              return status < 500;
-            }
-          });
-          
-          console.log(`Asset Delivery API response status: ${response.status} for ${endpoint}`);
-          
+      try {
+        console.log(`Fetching listing types from Asset Delivery API: ${assetDeliveryEndpoint}`);
+        // Asset Delivery API uses Marketplace API client ID (no secret needed for read-only)
+        const response = await axios.get(assetDeliveryEndpoint, {
+          headers: {
+            'Accept': 'application/json'
+          },
+          validateStatus: function (status) {
+            return status < 500;
+          }
+        });
+        
+        console.log(`Asset Delivery API response status: ${response.status}`);
+        
           if (response.status >= 200 && response.status < 300) {
             const data = response.data;
-            console.log('=== Asset Delivery API Listing Types Response ===');
-            console.log('Full response:', JSON.stringify(data, null, 2));
+            console.log('=== Asset Delivery API Listing Types Response (FULL) ===');
+            console.log('Full JSON response:', JSON.stringify(data, null, 2));
             console.log('Response type:', typeof data);
             console.log('Is array:', Array.isArray(data));
-            if (data && typeof data === 'object') {
+            if (data && typeof data === 'object' && !Array.isArray(data)) {
               console.log('Response keys:', Object.keys(data));
             }
             
-            // Asset data might be in data array or directly as array
+            // Parse response - Asset Delivery API returns listing types
+            // According to ShareTribe docs: GET /a/latest/listings/listing-types.json
+            // Actual structure: { "data": { "listingTypes": [...] } }
             let listingTypes = [];
-            if (Array.isArray(data)) {
+            if (data && data.data && data.data.listingTypes && Array.isArray(data.data.listingTypes)) {
+              // Correct structure: { "data": { "listingTypes": [...] } }
+              listingTypes = data.data.listingTypes;
+              console.log('✅ Found listing types in data.data.listingTypes array');
+            } else if (Array.isArray(data)) {
               listingTypes = data;
-              console.log('Found listing types as direct array');
+              console.log('✅ Found listing types as direct array');
             } else if (data && data.data && Array.isArray(data.data)) {
               listingTypes = data.data;
-              console.log('Found listing types in data.data array');
-            } else if (data && data.listingTypes) {
-              listingTypes = Array.isArray(data.listingTypes) ? data.listingTypes : [data.listingTypes];
-              console.log('Found listing types in data.listingTypes');
+              console.log('✅ Found listing types in data.data array');
+            } else if (data && data.listingTypes && Array.isArray(data.listingTypes)) {
+              listingTypes = data.listingTypes;
+              console.log('✅ Found listing types in data.listingTypes');
             } else if (data && typeof data === 'object') {
-              console.log('Response is object but no listing types found. Structure:', JSON.stringify(data, null, 2).substring(0, 500));
+              console.log('⚠️ Unexpected response structure. Full response:', JSON.stringify(data, null, 2));
             }
+          
+          if (listingTypes.length > 0) {
+            console.log(`Successfully fetched ${listingTypes.length} listing types from Asset Delivery API`);
             
-            if (listingTypes.length > 0) {
-              console.log(`Successfully fetched ${listingTypes.length} listing types from Asset Delivery API`);
-              console.log('Sample listing type:', JSON.stringify(listingTypes[0], null, 2));
-              return listingTypes.map(lt => {
-                // Preserve full structure including attributes for stock type checking
-                const attrs = lt.attributes || lt;
-                return {
-                  id: lt.id || lt.key || lt.listingTypeId || lt.listing_type_id || attrs.id || attrs.key,
-                  name: lt.name || lt.label || lt.title || lt.id || attrs.name || attrs.label,
-                  label: lt.label || lt.name || lt.title || lt.id || attrs.label || attrs.name,
-                  attributes: attrs, // Preserve full attributes for stock type checking
-                  stockType: attrs.stockType || attrs.stock_type || attrs.stockTypeId,
-                  unitType: attrs.unitType || attrs.unit_type || attrs.unitTypeId
-                };
-              });
-            } else {
-              console.log('No listing types found in Asset Delivery API response');
-            }
+            // eBay listing types that should be filtered out (these are eBay-specific, not ShareTribe)
+            const ebayListingTypes = ['FixedPriceItem', 'FixedPrice', 'Auction', 'StoresFixedPrice', 'Chinese'];
+            
+            // Process listing types - only use those with proper id field and filter out eBay types
+            const uniqueListingTypesMap = new Map();
+            listingTypes.forEach((lt, index) => {
+              // Log ALL listing types from API to see what we're getting
+              console.log(`\n--- Listing type ${index} from Asset Delivery API ---`);
+              console.log('Full object:', JSON.stringify(lt, null, 2));
+              
+              // Extract ID - Asset Delivery API structure has id directly on the object
+              // Structure: { "id": "list-new-item", "label": "Sale (You keep 90%)", ... }
+              const id = lt.id;
+              
+              // Get name/label - Asset Delivery API uses "label" field directly on object
+              const name = lt.name || '';
+              const label = lt.label || '';
+              
+              console.log(`Extracted - ID: "${id}", Name: "${name}", Label: "${label}"`);
+              
+              // Only add if we have a valid id field
+              if (!id) {
+                console.warn(`⚠️ SKIPPED - No id field found`);
+                return;
+              }
+              
+              // Filter out eBay listing types - check both ID and name/label fields
+              const isEbayType = ebayListingTypes.includes(id) || 
+                                 ebayListingTypes.includes(name) || 
+                                 ebayListingTypes.includes(label) ||
+                                 id.toLowerCase().includes('fixedprice') ||
+                                 id.toLowerCase().includes('auction') ||
+                                 name.toLowerCase().includes('fixedprice') ||
+                                 name.toLowerCase().includes('auction') ||
+                                 label.toLowerCase().includes('fixedprice') ||
+                                 label.toLowerCase().includes('auction');
+              
+              if (isEbayType) {
+                console.warn(`⚠️ FILTERED OUT eBay listing type - ID: "${id}", Name: "${name}", Label: "${label}"`);
+                return; // Skip this listing type
+              }
+              
+              if (!uniqueListingTypesMap.has(id)) {
+                uniqueListingTypesMap.set(id, {
+                  id: id, // Use the actual ID from API
+                  name: name || label || id,
+                  label: label || name || id,
+                  attributes: lt, // Store full object as attributes
+                  stockType: lt.stockType,
+                  unitType: lt.unitType,
+                  transactionProcess: lt.transactionProcess,
+                  defaultListingFields: lt.defaultListingFields,
+                  priceVariations: lt.priceVariations,
+                  availabilityType: lt.availabilityType
+                });
+                console.log(`✅ ADDED listing type: ID="${id}", Label="${label || name || id}"`);
+              } else {
+                console.log(`⚠️ Duplicate listing type ID "${id}" skipped`);
+              }
+            });
+            
+            const result = Array.from(uniqueListingTypesMap.values());
+            console.log(`Returning ${result.length} unique listing types with IDs:`, result.map(lt => lt.id));
+            return result;
           } else {
-            console.log(`Asset Delivery API returned non-200 status: ${response.status}`);
+            console.log('No listing types found in Asset Delivery API response');
+          }
+        } else {
+          console.log(`Asset Delivery API returned non-200 status: ${response.status}`);
+          if (response.data) {
             console.log('Response:', JSON.stringify(response.data, null, 2).substring(0, 500));
           }
-        } catch (err) {
-          console.log(`Asset Delivery API endpoint ${endpoint} failed: ${err.message}`);
-          if (err.response) {
-            console.log(`Response status: ${err.response.status}`);
-            console.log(`Response data:`, JSON.stringify(err.response.data, null, 2).substring(0, 500));
-          }
-          continue;
+        }
+      } catch (err) {
+        console.error(`Asset Delivery API endpoint failed: ${err.message}`);
+        if (err.response) {
+          console.error(`Response status: ${err.response.status}`);
+          console.error(`Response data:`, JSON.stringify(err.response.data, null, 2).substring(0, 500));
         }
       }
       
@@ -2231,96 +2285,27 @@ class ShareTribeService {
         })
       ]);
 
-      // If Asset Delivery API didn't return data (common in test environments before deployment),
-      // try to infer from existing listings as a fallback
-      if ((listingTypes.length === 0 || categories.length === 0 || listingFields.length === 0) && this.marketplaceId) {
-        console.log('Asset Delivery API returned empty results, attempting to infer metadata from existing listings...');
-        try {
-          const existingListings = await this.getAllListings().catch(err => {
-            console.log('Could not fetch existing listings for inference:', err.message);
-            return [];
-          });
-          
-          if (existingListings && existingListings.length > 0) {
-            console.log(`Found ${existingListings.length} existing listings to analyze`);
-            
-            const uniqueListingTypes = new Set();
-            const uniqueCategories = new Set();
-            const allFields = new Map();
-            
-            existingListings.forEach(listing => {
-              // Get publicData - could be nested in attributes or at top level
-              const publicData = listing.attributes?.publicData || listing.publicData || {};
-              
-              // Extract listing type from publicData.listingType
-              const listingTypeId = publicData.listingType;
-              if (listingTypeId) {
-                uniqueListingTypes.add(listingTypeId);
-              }
-              
-              // Extract categories from categoryLevel1, categoryLevel2, etc.
-              Object.keys(publicData).forEach(key => {
-                if (key.startsWith('categoryLevel') || key === 'category') {
-                  const categoryId = publicData[key];
-                  if (categoryId) {
-                    uniqueCategories.add(categoryId);
-                  }
-                }
-              });
-              
-              // Extract all custom fields from publicData
-              const standardFields = ['listingType', 'category', 'categoryLevel1', 'categoryLevel2', 'categoryLevel3', 'location', 'parcel'];
-              Object.keys(publicData).forEach(key => {
-                if (!standardFields.includes(key) && !key.startsWith('categoryLevel')) {
-                  if (!allFields.has(key)) {
-                    const value = publicData[key];
-                    allFields.set(key, {
-                      id: key,
-                      label: key.charAt(0).toUpperCase() + key.slice(1).replace(/_/g, ' ').replace(/([A-Z])/g, ' $1').trim(),
-                      type: Array.isArray(value) ? 'array' : (value === null || value === undefined ? 'text' : typeof value),
-                      required: false,
-                      listingTypeIds: [],
-                      categoryIds: []
-                    });
-                  }
-                }
-              });
-            });
-            
-            // Use inferred data only if Asset Delivery API didn't return anything
-            if (listingTypes.length === 0 && uniqueListingTypes.size > 0) {
-              listingTypes.push(...Array.from(uniqueListingTypes).map((typeId) => ({
-                id: typeId,
-                name: typeId.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
-                label: typeId.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase())
-              })));
-              console.log(`Inferred ${listingTypes.length} listing types from existing listings`);
-            }
-            
-            if (categories.length === 0 && uniqueCategories.size > 0) {
-              categories.push(...Array.from(uniqueCategories).map((catId) => ({
-                id: catId,
-                name: typeof catId === 'string' ? catId.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) : catId,
-                label: typeof catId === 'string' ? catId.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) : catId
-              })));
-              console.log(`Inferred ${categories.length} categories from existing listings`);
-            }
-            
-            if (listingFields.length === 0 && allFields.size > 0) {
-              listingFields.push(...Array.from(allFields.values()));
-              console.log(`Inferred ${listingFields.length} listing fields from existing listings`);
-            }
-          } else {
-            console.log('No existing listings found to infer metadata from');
-          }
-        } catch (err) {
-          console.error('Error inferring metadata from listings:', err.message);
-        }
+      // CRITICAL: Use ONLY listing types from Asset Delivery API
+      // Do NOT infer from existing listings - this can include eBay listing types like "FixedPriceItem"
+      // The Asset Delivery API is the source of truth for listing types configured in ShareTribe Console
+      
+      console.log(`📋 Asset Delivery API returned ${listingTypes.length} listing types`);
+      if (listingTypes.length > 0) {
+        console.log('✅ Listing type IDs from Asset Delivery API:', listingTypes.map(lt => lt.id || 'NO_ID'));
+      } else {
+        console.warn('⚠️ Asset Delivery API returned zero listing types. Not inferring from existing listings.');
+        console.warn('⚠️ Please ensure listing types are configured in your ShareTribe Console.');
       }
 
       // Fetch marketplace configuration to get default currency
-      const marketplaceConfig = await this.getMarketplaceConfig();
-      const defaultCurrency = marketplaceConfig?.currency || null;
+      let defaultCurrency = null;
+      try {
+        const marketplaceConfig = await this.getMarketplaceConfig();
+        defaultCurrency = marketplaceConfig?.currency || null;
+      } catch (marketplaceConfigError) {
+        console.warn('Could not fetch marketplace config for default currency:', marketplaceConfigError.message);
+        // Continue without default currency - not critical
+      }
 
       return {
         listingTypes: listingTypes,

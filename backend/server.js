@@ -180,6 +180,7 @@ app.get('/', (req, res) => {
       <a href="/logs" onclick="loadPage('logs'); return false;">Logs</a>
       <a href="/products" onclick="loadPage('products'); return false;">Products</a>
       <a href="/api-data" onclick="loadPage('api-data'); return false;">API Data</a>
+      <a href="/asset-delivery" onclick="loadPage('asset-delivery'); return false;">Asset Delivery API</a>
     </nav>
     
     <div class="content" id="content">
@@ -190,6 +191,7 @@ app.get('/', (req, res) => {
           <li><strong>Logs</strong> - View server logs in real-time</li>
           <li><strong>Products</strong> - View synced products from database</li>
           <li><strong>API Data</strong> - View recent API responses and sync data</li>
+          <li><strong>Asset Delivery API</strong> - View raw Asset Delivery API responses for listing types</li>
         </ul>
         
         <div class="stats" id="stats">
@@ -253,6 +255,15 @@ app.get('/', (req, res) => {
           </div>
         \`;
         loadApiData();
+      } else if (page === 'asset-delivery') {
+        content.innerHTML = \`
+          <h2>Asset Delivery API Response</h2>
+          <button class="refresh-btn" onclick="loadAssetDeliveryApi()">🔄 Fetch Latest Response</button>
+          <div id="asset-delivery-container">
+            <div class="loading">Loading Asset Delivery API response...</div>
+          </div>
+        \`;
+        loadAssetDeliveryApi();
       }
     }
     
@@ -419,6 +430,88 @@ app.get('/', (req, res) => {
           clearInterval(autoRefreshInterval);
           autoRefreshInterval = null;
         }
+      }
+    }
+    
+    async function loadAssetDeliveryApi() {
+      try {
+        const res = await fetch('/api/admin/asset-delivery-api');
+        const data = await res.json();
+        const container = document.getElementById('asset-delivery-container');
+        
+        let html = '';
+        
+        if (data.error && !data.response) {
+          html += '<div style="background: #fef2f2; border-left: 4px solid #ef4444; padding: 15px; border-radius: 5px; margin-bottom: 15px;">';
+          html += '<strong style="color: #dc2626;">Error:</strong> ' + escapeHtml(data.error);
+          html += '</div>';
+        }
+        
+        html += '<div style="margin-bottom: 20px;">';
+        html += '<h3 style="margin-bottom: 10px;">Endpoint</h3>';
+        html += '<div class="json-view" style="word-break: break-all;">' + escapeHtml(data.endpoint || 'N/A') + '</div>';
+        html += '</div>';
+        
+        html += '<div style="margin-bottom: 20px;">';
+        html += '<h3 style="margin-bottom: 10px;">Status</h3>';
+        html += '<div style="font-size: 18px; font-weight: bold; color: ' + (data.status >= 200 && data.status < 300 ? '#10b981' : '#ef4444') + ';">';
+        html += data.status || 'N/A';
+        html += '</div>';
+        html += '</div>';
+        
+        if (data.error) {
+          html += '<div style="margin-bottom: 20px;">';
+          html += '<h3 style="margin-bottom: 10px;">Error Details</h3>';
+          html += '<div class="json-view">' + JSON.stringify(data.error, null, 2).replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>';
+          html += '</div>';
+        }
+        
+        html += '<div style="margin-bottom: 20px;">';
+        html += '<h3 style="margin-bottom: 10px;">Full Response</h3>';
+        html += '<details open><summary style="cursor: pointer; font-weight: bold; color: #374151; margin-bottom: 5px;">📥 Click to expand/collapse</summary>';
+        html += '<div class="json-view" style="margin-top: 10px; max-height: 800px; overflow-y: auto;">';
+        html += JSON.stringify(data.response, null, 2).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        html += '</div></details>';
+        html += '</div>';
+        
+        html += '<div style="margin-bottom: 20px;">';
+        html += '<h3 style="margin-bottom: 10px;">Response Analysis</h3>';
+        if (data.response) {
+          const response = data.response;
+          let analysis = [];
+          
+          if (Array.isArray(response)) {
+            analysis.push('✅ Response is an array');
+            analysis.push('📊 Array length: ' + response.length);
+            if (response.length > 0) {
+              analysis.push('📋 First item keys: ' + Object.keys(response[0]).join(', '));
+              analysis.push('📋 First item structure:');
+              analysis.push(JSON.stringify(response[0], null, 2));
+            }
+          } else if (response && typeof response === 'object') {
+            analysis.push('✅ Response is an object');
+            analysis.push('📊 Object keys: ' + Object.keys(response).join(', '));
+            if (response.data && Array.isArray(response.data)) {
+              analysis.push('✅ Found data.data array with ' + response.data.length + ' items');
+            }
+            if (response.listingTypes && Array.isArray(response.listingTypes)) {
+              analysis.push('✅ Found data.listingTypes array with ' + response.listingTypes.length + ' items');
+            }
+          }
+          
+          html += '<div class="json-view" style="white-space: pre-wrap;">' + analysis.join('\\n').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>';
+        } else {
+          html += '<div style="color: #6b7280;">No response data available</div>';
+        }
+        html += '</div>';
+        
+        html += '<div style="margin-bottom: 20px; font-size: 12px; color: #6b7280;">';
+        html += 'Last fetched: ' + (data.timestamp ? new Date(data.timestamp).toLocaleString() : 'N/A');
+        html += '</div>';
+        
+        container.innerHTML = html;
+      } catch (e) {
+        document.getElementById('asset-delivery-container').innerHTML = '<div class="log-error">Error loading Asset Delivery API response: ' + e.message + '</div>';
       }
     }
     

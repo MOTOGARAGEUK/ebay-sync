@@ -2341,7 +2341,65 @@ router.post('/debug/test-sharetribe', async (req, res) => {
   }
 });
 
-// Debug endpoint to show ShareTribe configuration (without exposing secrets)
+// Debug endpoint: Get Asset Delivery API responses
+router.get('/admin/asset-delivery-api', async (req, res) => {
+  try {
+    const tenantId = getTenantId(req);
+    const config = await syncService.getApiConfig(tenantId);
+    
+    if (!config.sharetribe || !config.sharetribe.marketplaceApiClientId) {
+      return res.status(400).json({ 
+        error: 'ShareTribe Marketplace API Client ID not configured',
+        endpoint: null,
+        response: null
+      });
+    }
+    
+    const marketplaceApiClientId = config.sharetribe.marketplaceApiClientId;
+    const assetDeliveryEndpoint = `https://cdn.st-api.com/v1/assets/pub/${marketplaceApiClientId}/a/latest/listings/listing-types.json`;
+    
+    const axios = require('axios');
+    let responseData = null;
+    let responseStatus = null;
+    let error = null;
+    
+    try {
+      const response = await axios.get(assetDeliveryEndpoint, {
+        headers: {
+          'Accept': 'application/json'
+        },
+        validateStatus: function (status) {
+          return status < 500; // Don't throw on 4xx errors
+        }
+      });
+      
+      responseStatus = response.status;
+      responseData = response.data;
+    } catch (err) {
+      error = {
+        message: err.message,
+        code: err.code,
+        response: err.response ? {
+          status: err.response.status,
+          statusText: err.response.statusText,
+          data: err.response.data
+        } : null
+      };
+    }
+    
+    res.json({
+      endpoint: assetDeliveryEndpoint,
+      status: responseStatus,
+      response: responseData,
+      error: error,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error fetching Asset Delivery API response:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.get('/debug/sharetribe-config', async (req, res) => {
   try {
     const tenantId = getTenantId(req);
