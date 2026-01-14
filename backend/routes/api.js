@@ -1891,20 +1891,92 @@ router.get('/sync/progress/:jobId', (req, res) => {
       etaFormatted = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
     }
     
-    // Include rate limit info if present
-    const rateLimitInfo = syncService.rateLimitStatus?.get(jobId);
+    // Build response with explicit retry state fields
+    const now = Date.now();
+    const lastUpdate = progress.updatedAt || progress.lastUpdatedAt || progress.lastUpdate || now;
+    const secondsSinceUpdate = Math.floor((now - lastUpdate) / 1000);
+    
+    // Check if progress is stale (no update for >10s) - treat as PAUSED with auto-resume
+    const isStale = secondsSinceUpdate > 10 && 
+                    progress.state !== 'COMPLETED' && 
+                    progress.state !== 'COMPLETED_SUCCESS' &&
+                    progress.state !== 'FAILED';
+    
+    // Calculate backoff: exponential backoff based on stale duration
+    const backoffSeconds = Math.min(30, Math.max(2, Math.floor(secondsSinceUpdate / 5))); // 2-30s backoff
+    const staleResumeAt = isStale ? now + (backoffSeconds * 1000) : null;
+    
+    // Determine resumeAt: use retryAt if available, otherwise use staleResumeAt
+    let resumeAt = progress.retryAt || progress.nextRetryAt || staleResumeAt;
+    
+    // Determine state: if stale and not terminal, set to PAUSED
+    let responseState = progress.state || progress.status || 'RUNNING';
+    if (isStale && !resumeAt) {
+      responseState = 'PAUSED';
+      resumeAt = staleResumeAt;
+    }
+    
     const response = {
       ...progress,
-      etaFormatted: etaFormatted
+      etaFormatted: etaFormatted,
+      // Explicit state machine fields - use PAUSED for all pause scenarios
+      state: responseState,
+      // Timestamps
+      lastUpdatedAt: lastUpdate,
+      updatedAt: lastUpdate,
+      lastAttemptAt: progress.lastAttemptAt || null,
+      // Resume fields (always populated when PAUSED)
+      nextRetryAt: resumeAt,
+      retryAt: resumeAt, // Explicit resumeAt timestamp
+      retryInMs: resumeAt ? Math.max(0, resumeAt - now) : null,
+      retryAttemptCount: progress.retryAttemptCount || 0,
+      // Error fields
+      lastErrorCode: progress.lastErrorCode || null,
+      lastErrorMessage: progress.lastErrorMessage || null,
+      // Progress tracking
+      processed: progress.processed !== undefined 
+        ? progress.processed 
+        : ((progress.completed || 0) + (progress.failed || 0)),
+      remaining: progress.remaining !== undefined
+        ? progress.remaining
+        : Math.max(0, (progress.total || 0) - ((progress.completed || 0) + (progress.failed || 0))),
+      failedCount: progress.failed || 0, // Explicit failedCount for UI
+      // Backward compatibility fields
+      rateLimited: progress.rateLimited || false,
+      retryInSeconds: resumeAt ? Math.ceil(Math.max(0, resumeAt - now) / 1000) : null,
+      rateLimitRetryAfter: resumeAt ? Math.ceil(Math.max(0, resumeAt - now) / 1000) : null
     };
     
+    // Update rate limit info from rateLimitStatus map if present
+    const rateLimitInfo = syncService.rateLimitStatus?.get(jobId);
     if (rateLimitInfo && rateLimitInfo.paused) {
-      const elapsed = Math.floor((Date.now() - rateLimitInfo.pausedAt) / 1000);
-      const remaining = Math.max(0, rateLimitInfo.retryAfter - elapsed);
-      response.rateLimitRetryAfter = remaining;
-      if (progress.status !== 'rate_limited') {
-        response.status = 'rate_limited';
+      const retryAt = rateLimitInfo.retryAt || rateLimitInfo.nextRetryAt || (rateLimitInfo.pausedAt + (rateLimitInfo.retryAfterMs || rateLimitInfo.retryAfter * 1000));
+      const retryInMs = Math.max(0, retryAt - now);
+      const retryInSeconds = Math.ceil(retryInMs / 1000);
+      
+      response.state = 'PAUSED';
+      response.status = 'retry_scheduled';
+      response.rateLimited = true;
+      response.nextRetryAt = retryAt;
+      response.retryAt = retryAt; // Explicit resumeAt timestamp
+      response.retryInMs = retryInMs;
+      response.retryInSeconds = retryInSeconds;
+      response.rateLimitRetryAfter = retryInSeconds;
+      // Include retry attempt info from rateLimitInfo if not already in progress
+      if (rateLimitInfo.retryAttemptCount !== undefined) {
+        response.retryAttemptCount = rateLimitInfo.retryAttemptCount;
       }
+      if (rateLimitInfo.pausedAt) {
+        response.lastAttemptAt = rateLimitInfo.pausedAt;
+      }
+    } else if (isStale && resumeAt) {
+      // Stale update - ensure PAUSED state with resumeAt
+      response.state = 'PAUSED';
+      response.status = 'retry_scheduled';
+      response.nextRetryAt = resumeAt;
+      response.retryAt = resumeAt;
+      response.retryInMs = Math.max(0, resumeAt - now);
+      response.retryInSeconds = Math.ceil(response.retryInMs / 1000);
     }
     
     res.json(response);

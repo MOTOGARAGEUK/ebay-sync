@@ -1,34 +1,59 @@
 /**
  * ShareTribe Integration API Rate Limiter
  * 
- * Implements token bucket algorithm with concurrency control to respect API limits:
- * - /listings/create: 100 requests/min average
- * - POST endpoints: 30/min average (dev/test)
- * - GET endpoints: 60/min average (dev/test)
+ * Implements token bucket algorithm for smooth throttling:
+ * - /listings/create: 100 requests per 60 seconds (capacity=100, refill=100/60 per sec)
+ * - POST endpoints: 30/min (capacity=30, refill=30/60 per sec)
+ * - GET endpoints: 60/min (capacity=60, refill=60/60 per sec)
  * - Concurrency: max 10 concurrent requests per client IP (we use max 5 for safety)
+ * 
+ * Features:
+ * - Smooth throttling (no burst pauses)
+ * - Safety buffer on retries (+1500ms)
+ * - Gradual concurrency ramp-up after rate limit
  */
+
+class RateLimitError extends Error {
+  constructor(waitMs, endpointType, retryAt = null) {
+    super(`Rate limit exceeded. Retry after ${Math.ceil(waitMs / 1000)}s`);
+    this.type = 'RATE_LIMIT';
+    this.retryAfterMs = waitMs;
+    this.endpointType = endpointType;
+    this.retryAt = retryAt; // Absolute timestamp (epoch ms) when retry should happen
+  }
+}
 
 class ShareTribeRateLimiter {
   constructor(options = {}) {
-    // Rate limits (requests per minute)
-    this.createListingRate = options.createListingRate || 90; // Headroom under 100/min
-    this.postRate = options.postRate || 25; // Headroom under 30/min
-    this.getRate = options.getRate || 55; // Headroom under 60/min
+    // Rate limits (requests per 60 seconds)
+    this.createListingRate = options.createListingRate || 100; // Capacity
+    this.postRate = options.postRate || 30;
+    this.getRate = options.getRate || 60;
     
-    // Concurrency limits
-    this.maxConcurrency = options.maxConcurrency || 5; // Safety margin under 10
+    // Fixed pacing: minimum time between requests (750ms = ~80 requests/min, safe under 100/min)
+    this.minRequestInterval = options.minRequestInterval || 750; // milliseconds
     
-    // Token buckets: start with full capacity
-    this.createListingTokens = this.createListingRate;
-    this.postTokens = this.postRate;
-    this.getTokens = this.getRate;
-    
-    // Track last refill time for each bucket
-    this.lastRefillTime = {
-      create: Date.now(),
-      post: Date.now(),
-      get: Date.now()
+    // Track request timestamps for sliding window (one array per endpoint type)
+    this.requestTimestamps = {
+      create: [],
+      post: [],
+      get: []
     };
+    
+    // Track last request time for pacing
+    this.lastRequestTime = {
+      create: 0,
+      post: 0,
+      get: 0
+    };
+    
+    // Concurrency limits (start low, ramp up)
+    this.maxConcurrency = options.maxConcurrency || 2; // Start with 2 for safety
+    this.currentMaxConcurrency = 1; // Start with 1, ramp up after resume
+    
+    // Track when we last hit rate limit (for gradual ramp-up)
+    this.lastRateLimitHit = null;
+    this.rampUpStartTime = null;
     
     // Track in-flight requests
     this.inFlightRequests = 0;
@@ -42,6 +67,12 @@ class ShareTribeRateLimiter {
     
     // Track rate limit events for progress updates
     this.rateLimitCallbacks = new Map(); // jobId -> callback function
+    
+    // Safety buffer for retries (milliseconds)
+    this.safetyBufferMs = options.safetyBufferMs || 1500;
+    
+    // Window size in milliseconds (60 seconds)
+    this.windowMs = 60000;
   }
   
   /**
@@ -69,38 +100,116 @@ class ShareTribeRateLimiter {
   }
   
   /**
-   * Refill tokens based on elapsed time (continuous refill)
+   * Clean old timestamps outside the sliding window
    */
-  refillTokens(endpointType) {
+  cleanOldTimestamps(endpointType) {
     const now = Date.now();
-    const lastRefill = this.lastRefillTime[endpointType];
-    const elapsedSeconds = (now - lastRefill) / 1000;
+    const timestamps = this.requestTimestamps[endpointType];
     
-    let tokensToAdd = 0;
-    let maxTokens = 0;
+    // Remove timestamps older than 60 seconds
+    while (timestamps.length > 0 && now - timestamps[0] > this.windowMs) {
+      timestamps.shift();
+    }
+  }
+  
+  /**
+   * Check rate limit using sliding window + fixed pacing
+   * Returns wait time in milliseconds if rate limited, or 0 if allowed
+   * Also returns oldestTimestamp for retryAt calculation
+   */
+  checkRateLimit(endpointType) {
+    const now = Date.now();
+    const timestamps = this.requestTimestamps[endpointType];
     
+    // Clean old timestamps
+    this.cleanOldTimestamps(endpointType);
+    
+    // Get rate limit for this endpoint type
+    let rateLimit;
     switch (endpointType) {
       case 'create':
-        // 90 tokens per 60 seconds = 1.5 tokens per second
-        tokensToAdd = (this.createListingRate / 60) * elapsedSeconds;
-        maxTokens = this.createListingRate;
-        this.createListingTokens = Math.min(maxTokens, this.createListingTokens + tokensToAdd);
+        rateLimit = this.createListingRate;
         break;
       case 'post':
-        // 25 tokens per 60 seconds = ~0.417 tokens per second
-        tokensToAdd = (this.postRate / 60) * elapsedSeconds;
-        maxTokens = this.postRate;
-        this.postTokens = Math.min(maxTokens, this.postTokens + tokensToAdd);
+        rateLimit = this.postRate;
         break;
       case 'get':
-        // 55 tokens per 60 seconds = ~0.917 tokens per second
-        tokensToAdd = (this.getRate / 60) * elapsedSeconds;
-        maxTokens = this.getRate;
-        this.getTokens = Math.min(maxTokens, this.getTokens + tokensToAdd);
+        rateLimit = this.getRate;
         break;
+      default:
+        rateLimit = 100;
     }
     
-    this.lastRefillTime[endpointType] = now;
+    // Check sliding window limit
+    if (timestamps.length >= rateLimit) {
+      // Calculate retryAt using sliding window: oldestTimestamp + 60000 + buffer
+      const oldestTimestamp = timestamps[0];
+      const retryAt = oldestTimestamp + this.windowMs + this.safetyBufferMs;
+      const waitMs = Math.max(0, retryAt - now);
+      
+      return { waitMs, oldestTimestamp, retryAt };
+    }
+    
+    // Check fixed pacing (minimum time between requests)
+    const lastRequestTime = this.lastRequestTime[endpointType];
+    const timeSinceLastRequest = now - lastRequestTime;
+    
+    if (timeSinceLastRequest < this.minRequestInterval) {
+      const waitMs = this.minRequestInterval - timeSinceLastRequest;
+      return { waitMs, oldestTimestamp: null, retryAt: null };
+    }
+    
+    // We can proceed
+    return { waitMs: 0, oldestTimestamp: null, retryAt: null };
+  }
+  
+  /**
+   * Record a request timestamp
+   */
+  recordRequest(endpointType) {
+    const now = Date.now();
+    this.requestTimestamps[endpointType].push(now);
+    this.lastRequestTime[endpointType] = now;
+    
+    // Clean old timestamps (keep array size manageable)
+    this.cleanOldTimestamps(endpointType);
+  }
+  
+  /**
+   * Update concurrency limit based on ramp-up schedule
+   * On resume after rate limit, start with 1 request, then ramp up gradually
+   */
+  updateConcurrencyLimit() {
+    const now = Date.now();
+    
+    // If we haven't hit rate limit recently (10s), use full concurrency
+    if (!this.lastRateLimitHit || (now - this.lastRateLimitHit) > 10000) {
+      this.currentMaxConcurrency = this.maxConcurrency;
+      this.rampUpStartTime = null;
+      return;
+    }
+    
+    // If we just hit rate limit, start ramp-up with 1 request
+    if (!this.rampUpStartTime) {
+      this.rampUpStartTime = now;
+      this.currentMaxConcurrency = 1; // Start with 1 request
+      console.log(`📊 [RateLimiter] Starting ramp-up: concurrency = 1`);
+      return;
+    }
+    
+    // Gradual ramp-up schedule after rate limit:
+    // 0-5s: concurrency = 1 (single request)
+    // 5-10s: concurrency = 2
+    // 10s+: concurrency = normal (2)
+    const elapsedSinceRampUp = now - this.rampUpStartTime;
+    
+    if (elapsedSinceRampUp < 5000) {
+      this.currentMaxConcurrency = 1;
+    } else if (elapsedSinceRampUp < 10000) {
+      this.currentMaxConcurrency = 2;
+    } else {
+      this.currentMaxConcurrency = this.maxConcurrency; // Normal (2)
+    }
   }
   
   /**
@@ -136,63 +245,57 @@ class ShareTribeRateLimiter {
    * Wait for available token and concurrency slot
    */
   async acquireToken(endpointType) {
-    return new Promise((resolve) => {
-      const checkAvailability = () => {
-        // Refill tokens based on elapsed time (continuous refill)
-        this.refillTokens(endpointType);
+    return new Promise((resolve, reject) => {
+      const checkAvailability = async () => {
+        // Update concurrency limit based on ramp-up schedule
+        this.updateConcurrencyLimit();
         
-        // Check concurrency first
-        if (this.inFlightRequests >= this.maxConcurrency) {
-          // Queue the request
+        // Check rate limit (sliding window + pacing)
+        const rateLimitCheck = this.checkRateLimit(endpointType);
+        
+        if (rateLimitCheck.waitMs > 0) {
+          // Rate limited - use retryAt from sliding window if available
+          let waitMs = rateLimitCheck.waitMs;
+          let retryAt = rateLimitCheck.retryAt;
+          
+          // If we have oldestTimestamp, calculate proper retryAt
+          if (rateLimitCheck.oldestTimestamp) {
+            retryAt = rateLimitCheck.oldestTimestamp + this.windowMs + this.safetyBufferMs;
+            waitMs = Math.max(0, retryAt - Date.now());
+          }
+          
+          // Record rate limit hit for ramp-up
+          this.lastRateLimitHit = Date.now();
+          
+          reject(new RateLimitError(waitMs, endpointType, retryAt));
+          return;
+        }
+        
+        // Check fixed pacing (minimum time between requests)
+        const lastRequestTime = this.lastRequestTime[endpointType];
+        const now = Date.now();
+        const timeSinceLastRequest = now - lastRequestTime;
+        
+        if (timeSinceLastRequest < this.minRequestInterval) {
+          // Need to wait for pacing
+          const waitMs = this.minRequestInterval - timeSinceLastRequest;
+          setTimeout(checkAvailability, waitMs);
+          return;
+        }
+        
+        // Check concurrency limit (using current max, which may be reduced)
+        if (this.inFlightRequests >= this.currentMaxConcurrency) {
+          // Queue the request (concurrency limit)
           this.requestQueue.push({ endpointType, resolve, checkAvailability });
           return;
         }
         
-        // Check token availability
-        let hasToken = false;
-        switch (endpointType) {
-          case 'create':
-            if (this.createListingTokens >= 1) {
-              this.createListingTokens -= 1;
-              hasToken = true;
-            }
-            break;
-          case 'post':
-            if (this.postTokens >= 1) {
-              this.postTokens -= 1;
-              hasToken = true;
-            }
-            break;
-          case 'get':
-            if (this.getTokens >= 1) {
-              this.getTokens -= 1;
-              hasToken = true;
-            }
-            break;
-        }
+        // Record the request timestamp
+        this.recordRequest(endpointType);
         
-        if (hasToken) {
-          this.inFlightRequests++;
-          resolve();
-        } else {
-          // Not enough tokens, calculate wait time based on refill rate
-          let waitTime = 100; // Default 100ms
-          switch (endpointType) {
-            case 'create':
-              // 1.5 tokens per second = 667ms per token
-              waitTime = Math.ceil(1000 / (this.createListingRate / 60));
-              break;
-            case 'post':
-              // ~0.417 tokens per second = ~2400ms per token
-              waitTime = Math.ceil(1000 / (this.postRate / 60));
-              break;
-            case 'get':
-              // ~0.917 tokens per second = ~1091ms per token
-              waitTime = Math.ceil(1000 / (this.getRate / 60));
-              break;
-          }
-          setTimeout(checkAvailability, waitTime);
-        }
+        // Increment in-flight counter
+        this.inFlightRequests++;
+        resolve();
       };
       
       checkAvailability();
@@ -205,8 +308,11 @@ class ShareTribeRateLimiter {
   releaseSlot() {
     this.inFlightRequests--;
     
-    // Process queued requests
-    if (this.requestQueue.length > 0 && this.inFlightRequests < this.maxConcurrency) {
+    // Update concurrency limit (may have changed due to ramp-up)
+    this.updateConcurrencyLimit();
+    
+    // Process queued requests (respecting current max concurrency)
+    if (this.requestQueue.length > 0 && this.inFlightRequests < this.currentMaxConcurrency) {
       const next = this.requestQueue.shift();
       next.checkAvailability();
     }
@@ -221,7 +327,7 @@ class ShareTribeRateLimiter {
     
     while (true) {
       try {
-        // Acquire token and concurrency slot
+        // Acquire token and concurrency slot (may throw RateLimitError)
         await this.acquireToken(endpointType);
         
         // Execute the request
@@ -233,9 +339,43 @@ class ShareTribeRateLimiter {
         
         return response;
       } catch (error) {
-        this.releaseSlot();
+        // Check if it's our RateLimitError (from sliding window + pacing check)
+        if (error instanceof RateLimitError) {
+          const waitMs = error.retryAfterMs;
+          const retryAt = error.retryAt || (Date.now() + waitMs);
+          const waitSeconds = Math.ceil(waitMs / 1000);
+          
+          // Record that we hit rate limit (for gradual ramp-up)
+          this.lastRateLimitHit = Date.now();
+          
+          // Clean timestamps to get accurate count
+          this.cleanOldTimestamps(endpointType);
+          
+          console.warn(`⚠️ Rate limit hit (sliding window + pacing) for request ${id}, endpoint: ${endpointType}`);
+          console.warn(`   Wait time: ${waitSeconds}s (${waitMs}ms)`);
+          console.warn(`   RetryAt: ${new Date(retryAt).toISOString()}`);
+          console.warn(`   Requests in window: ${this.requestTimestamps[endpointType].length}`);
+          console.warn(`   InFlight: ${this.inFlightRequests}, Queued: ${this.requestQueue.length}, MaxConcurrency: ${this.currentMaxConcurrency}`);
+          
+          // Notify all active callbacks with retryAt timestamp (for accurate countdown)
+          this.rateLimitCallbacks.forEach((callback, jobId) => {
+            if (callback.length === 1) {
+              // Old signature - convert to seconds
+              callback(waitSeconds);
+            } else {
+              // New signature - pass retryAt timestamp (epoch ms) for accuracy
+              callback(retryAt, 429, 'Rate limit exceeded');
+            }
+          });
+          
+          // Wait for the exact time
+          await new Promise(resolve => setTimeout(resolve, waitMs));
+          
+          // Continue loop to retry (don't increment attempt number for our own rate limiting)
+          continue;
+        }
         
-        // Check if it's a 429 rate limit error
+        // Check if it's a 429 from ShareTribe API
         if (error.response && error.response.status === 429) {
           attemptNumber++;
           this.retryAttempts.set(id, attemptNumber);
@@ -244,27 +384,50 @@ class ShareTribeRateLimiter {
           const retryAfter = error.response.headers['retry-after'] || 
                            error.response.headers['Retry-After'];
           
-          const backoffDelay = this.calculateBackoff(attemptNumber, retryAfter);
+          // Use Retry-After if provided, otherwise calculate from our token bucket
+          let waitMs;
+          if (retryAfter) {
+            waitMs = parseInt(retryAfter) * 1000;
+          } else {
+            // Fall back to our token bucket calculation
+            waitMs = this.checkRateLimit(endpointType);
+            if (waitMs === 0) {
+              // If we're not rate limited, use exponential backoff
+              waitMs = this.calculateBackoff(attemptNumber);
+            }
+          }
           
-          console.warn(`⚠️ Rate limit hit (429) for request ${id}, attempt ${attemptNumber}. Backing off for ${backoffDelay}ms`);
+          // Add safety buffer
+          waitMs += this.safetyBufferMs;
+          
+          // Record that we hit rate limit (for gradual ramp-up)
+          this.lastRateLimitHit = Date.now();
+          
+          const waitSeconds = Math.ceil(waitMs / 1000);
+          
+          console.warn(`⚠️ Rate limit hit (429 from API) for request ${id}, attempt ${attemptNumber}. Waiting ${waitSeconds}s`);
           console.warn(`   Endpoint type: ${endpointType}, InFlight: ${this.inFlightRequests}, Queued: ${this.requestQueue.length}`);
-          console.warn(`   Available tokens - Create: ${this.createListingTokens}, POST: ${this.postTokens}, GET: ${this.getTokens}`);
           
-          // Notify about rate limit (find jobId from requestId if possible)
-          // Try to extract jobId from requestId (format: "create_<ebay_item_id>" or "update_<listing_id>")
-          // For now, notify all active callbacks (we'll improve this later)
-          const retryAfterSeconds = retryAfter ? parseInt(retryAfter) : Math.ceil(backoffDelay / 1000);
+          // Notify callbacks
+          const errorCode = 429;
+          const errorMessage = error.response?.statusText || 'Rate limit exceeded';
+          
           this.rateLimitCallbacks.forEach((callback, jobId) => {
-            callback(retryAfterSeconds);
+            if (callback.length === 1) {
+              callback(waitSeconds);
+            } else {
+              callback(waitSeconds, errorCode, errorMessage);
+            }
           });
           
           // Wait before retrying
-          await new Promise(resolve => setTimeout(resolve, backoffDelay));
+          await new Promise(resolve => setTimeout(resolve, waitMs));
           
           // Continue loop to retry
           continue;
         } else {
           // Not a rate limit error, throw it
+          this.releaseSlot();
           this.retryAttempts.delete(id);
           throw error;
         }
@@ -314,13 +477,31 @@ class ShareTribeRateLimiter {
    * Get current rate limiter stats (for monitoring/debugging)
    */
   getStats() {
+    // Clean timestamps to get accurate counts
+    this.cleanOldTimestamps('create');
+    this.cleanOldTimestamps('post');
+    this.cleanOldTimestamps('get');
+    
     return {
       inFlightRequests: this.inFlightRequests,
       queuedRequests: this.requestQueue.length,
-      availableTokens: {
-        create: this.createListingTokens,
-        post: this.postTokens,
-        get: this.getTokens
+      requestsInWindow: {
+        create: this.requestTimestamps.create.length,
+        post: this.requestTimestamps.post.length,
+        get: this.requestTimestamps.get.length
+      },
+      rateLimits: {
+        create: this.createListingRate,
+        post: this.postRate,
+        get: this.getRate
+      },
+      concurrency: {
+        current: this.currentMaxConcurrency,
+        max: this.maxConcurrency
+      },
+      pacing: {
+        minInterval: this.minRequestInterval,
+        lastRequestTime: this.lastRequestTime
       },
       activeSyncJob: this.activeSyncJob
     };
@@ -329,4 +510,5 @@ class ShareTribeRateLimiter {
 
 // Export singleton instance
 module.exports = new ShareTribeRateLimiter();
+module.exports.RateLimitError = RateLimitError;
 

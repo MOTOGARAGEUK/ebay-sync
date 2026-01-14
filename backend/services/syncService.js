@@ -3,6 +3,13 @@ const eBayService = require('./ebayService');
 const ShareTribeService = require('./sharetribeService');
 const rateLimiter = require('../utils/sharetribeRateLimiter');
 
+// Format seconds as MM:SS
+function formatTime(seconds) {
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
 class SyncService {
   constructor() {
     // Store progress for active sync jobs
@@ -10,6 +17,9 @@ class SyncService {
     
     // Track rate limit status
     this.rateLimitStatus = new Map(); // jobId -> { retryAfter: seconds, paused: boolean }
+    
+    // Track resume timeouts for cleanup
+    this.resumeTimeouts = new Map(); // jobId -> timeoutId
   }
   
   /**
@@ -34,20 +44,96 @@ class SyncService {
   
   /**
    * Update progress for a sync job
+   * State machine: RUNNING, PAUSED_RATE_LIMIT, COMPLETED, FAILED
+   * Ensures updatedAt is refreshed every few seconds while RUNNING
    */
   updateSyncProgress(jobId, progress) {
+    const existingProgress = this.syncProgress.get(jobId) || {};
+    const now = Date.now();
+    
+    // Determine state based on status (explicit state machine)
+    // Terminal states: COMPLETED (only when processed === total), FAILED, CANCELLED
+    // Non-terminal: RUNNING, PAUSED (jobs auto-continue until done)
+    let state = 'RUNNING';
+    if (progress.status === 'rate_limited' || progress.status === 'retry_scheduled' || 
+        progress.state === 'PAUSED_RATE_LIMIT' || progress.state === 'PAUSED') {
+      state = 'PAUSED';
+    } else if (progress.state === 'COMPLETED' || progress.state === 'COMPLETED_SUCCESS' || 
+               progress.state === 'CANCELLED' || progress.state === 'FAILED') {
+      // Use explicit terminal state if provided
+      state = progress.state;
+    } else if (progress.status === 'completed') {
+      // Only COMPLETED if processed === total (100%)
+      const processed = (progress.completed || existingProgress.completed || 0) + (progress.failed || existingProgress.failed || 0);
+      const total = progress.total || existingProgress.total || 0;
+      
+      if (processed === total) {
+        state = 'COMPLETED';
+      } else {
+        // Not fully processed - keep as RUNNING or PAUSED (will auto-continue)
+        // Check if there's a retryAt - if so, PAUSED, otherwise RUNNING
+        state = (progress.retryAt || progress.nextRetryAt) ? 'PAUSED' : 'RUNNING';
+      }
+    } else if (progress.status === 'error' || progress.status === 'failed' || progress.state === 'FAILED') {
+      state = 'FAILED';
+    } else if (progress.status === 'in_progress' || progress.status === 'starting' || progress.status === 'running' || progress.state === 'RUNNING') {
+      state = 'RUNNING';
+    }
+    
+    // Calculate retryAt and retryInMs if nextRetryAt is provided
+    let retryAt = null;
+    let retryInMs = null;
+    if (progress.nextRetryAt || progress.retryAt) {
+      retryAt = progress.retryAt || (typeof progress.nextRetryAt === 'number' ? progress.nextRetryAt : new Date(progress.nextRetryAt).getTime());
+      retryInMs = Math.max(0, retryAt - now);
+    }
+    
+    // For RUNNING state, ensure updatedAt refreshes every few seconds
+    // This helps frontend detect if sync is still active
+    const finalState = progress.state || state;
+    const shouldRefreshUpdatedAt = finalState === 'RUNNING' && 
+                                   existingProgress.updatedAt && 
+                                   (now - existingProgress.updatedAt) > 3000; // Refresh every 3s
+    
     const progressData = {
+      ...existingProgress,
       ...progress,
-      lastUpdate: Date.now()
+      state: finalState,
+      lastUpdatedAt: now,
+      updatedAt: shouldRefreshUpdatedAt ? now : (progress.updatedAt || existingProgress.updatedAt || now), // Refresh every 3s while RUNNING
+      // Calculate processed and remaining
+      processed: progress.processed !== undefined ? progress.processed : 
+                 ((progress.completed !== undefined ? progress.completed : existingProgress.completed || 0) + 
+                  (progress.failed !== undefined ? progress.failed : existingProgress.failed || 0)),
+      // Lock total - never allow it to change after job starts
+      total: existingProgress.total || progress.total || total, // Preserve locked total
+      // Calculate remaining
+      remaining: progress.remaining !== undefined ? progress.remaining : 
+                 Math.max(0, (existingProgress.total || progress.total || total) - 
+                 ((progress.completed !== undefined ? progress.completed : existingProgress.completed || 0) + 
+                  (progress.failed !== undefined ? progress.failed : existingProgress.failed || 0))),
+      // Preserve retry fields if not being updated
+      lastAttemptAt: progress.lastAttemptAt || existingProgress.lastAttemptAt || null,
+      nextRetryAt: progress.nextRetryAt !== undefined ? progress.nextRetryAt : existingProgress.nextRetryAt,
+      retryAt: retryAt !== null ? retryAt : (progress.retryAt !== undefined ? progress.retryAt : existingProgress.retryAt), // Explicit retryAt timestamp
+      retryInMs: retryInMs !== null ? retryInMs : (progress.retryInMs !== undefined ? progress.retryInMs : existingProgress.retryInMs), // Milliseconds until retry
+      retryAttemptCount: progress.retryAttemptCount !== undefined ? progress.retryAttemptCount : (existingProgress.retryAttemptCount || 0),
+      lastErrorCode: progress.lastErrorCode || existingProgress.lastErrorCode || null,
+      lastErrorMessage: progress.lastErrorMessage || existingProgress.lastErrorMessage || null,
+      lastUpdate: now // Keep for backward compatibility
     };
+    
     this.syncProgress.set(jobId, progressData);
     console.log(`📋 [SyncService] Progress updated for job ${jobId}:`, {
+      state: progressData.state,
       total: progressData.total,
       completed: progressData.completed,
       failed: progressData.failed,
+      processed: progressData.processed,
       percent: progressData.percent,
-      status: progressData.status,
-      currentStep: progressData.currentStep
+      retryAt: progressData.retryAt ? new Date(progressData.retryAt).toISOString() : null,
+      retryInMs: progressData.retryInMs,
+      updatedAt: new Date(progressData.updatedAt).toISOString()
     });
   }
   
@@ -117,8 +203,10 @@ class SyncService {
     rateLimiter.registerSyncJob(syncJobId);
     
     // Register rate limit callback
-    rateLimiter.registerRateLimitCallback(syncJobId, (retryAfter) => {
-      this.handleRateLimit(syncJobId, retryAfter);
+    // Callback receives: (retryAt, errorCode, errorMessage)
+    // retryAt is epoch milliseconds (timestamp) when retry should happen
+    rateLimiter.registerRateLimitCallback(syncJobId, (retryAt, errorCode = 429, errorMessage = 'Rate limit exceeded') => {
+      this.handleRateLimit(syncJobId, retryAt, errorCode, errorMessage);
     });
     
     try {
@@ -338,15 +426,18 @@ class SyncService {
     console.log(`📋 [SyncService] productsToSync sample:`, productsToSync.slice(0, 2));
     
     if (totalProducts === 0) {
-      // No products to sync - update progress and return
+      // No products to sync - mark as COMPLETED_SUCCESS (nothing to do = success)
       console.log(`⚠️ [SyncService] No products to sync for job ${syncJobId}`);
       this.updateSyncProgress(syncJobId, {
         jobId: syncJobId,
         total: 0,
         completed: 0,
         failed: 0,
+        processed: 0,
+        remaining: 0,
         percent: 100,
         status: 'completed',
+        state: 'COMPLETED_SUCCESS',
         currentStep: 'No products to sync',
         eta: 0,
         errors: []
@@ -369,6 +460,7 @@ class SyncService {
     const completedTimes = []; // Track completion times for ETA calculation
     
     // Update progress with actual product count (progress was initialized in API route)
+    // Store sharetribeUserId in progress for resume continuation
     console.log(`📋 [SyncService] Updating progress for job ${syncJobId} with ${totalProducts} products`);
     this.updateSyncProgress(syncJobId, {
       jobId: syncJobId,
@@ -377,6 +469,8 @@ class SyncService {
       failed: 0,
       percent: 0,
       status: 'in_progress',
+      state: 'RUNNING',
+      sharetribeUserId: sharetribeUserId, // Store for resume continuation
       currentStep: `Starting sync of ${totalProducts} product(s)...`,
       eta: null,
       errors: []
@@ -389,38 +483,51 @@ class SyncService {
       const ebayProduct = productsToSync[i];
       const productIndex = i + 1;
       
-      // Check if we're paused due to rate limit
+      // Check if we're paused due to rate limit - wait until retryAt arrives
       const rateLimitInfo = this.rateLimitStatus.get(syncJobId);
       if (rateLimitInfo && rateLimitInfo.paused) {
-        const elapsed = Math.floor((Date.now() - rateLimitInfo.pausedAt) / 1000);
-        let remaining = Math.max(0, rateLimitInfo.retryAfter - elapsed);
+        const now = Date.now();
+        const retryAt = rateLimitInfo.retryAt || rateLimitInfo.nextRetryAt;
         
-        if (remaining > 0) {
-          // Still waiting for rate limit - update progress and wait
-          while (remaining > 0) {
-            this.updateSyncProgress(syncJobId, {
-              jobId: syncJobId,
-              total: totalProducts,
-              completed: syncedCount,
-              failed: failedCount,
-              percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
-              status: 'rate_limited',
-              currentStep: `Rate limit hit - waiting ${remaining}s for API limit refresh...`,
-              eta: null,
-              rateLimitRetryAfter: remaining,
-              errors: errors.slice(-10)
-            });
-            
-            // Wait 1 second and check again
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            const newElapsed = Math.floor((Date.now() - rateLimitInfo.pausedAt) / 1000);
-            remaining = Math.max(0, rateLimitInfo.retryAfter - newElapsed);
+        if (retryAt && now < retryAt) {
+          // Still waiting - update progress periodically
+          const retryInMs = Math.max(0, retryAt - now);
+          const retryInSeconds = Math.ceil(retryInMs / 1000);
+          
+          // Update progress with current wait status (PAUSED_RATE_LIMIT state)
+          this.updateSyncProgress(syncJobId, {
+            jobId: syncJobId,
+            total: totalProducts,
+            completed: syncedCount,
+            failed: failedCount,
+            percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
+            status: 'retry_scheduled',
+            state: 'PAUSED_RATE_LIMIT',
+            rateLimited: true,
+            nextRetryAt: retryAt,
+            retryAt: retryAt,
+            retryInMs: retryInMs,
+            retryInSeconds: retryInSeconds,
+            lastAttemptAt: rateLimitInfo.pausedAt,
+            currentStep: `Sharetribe rate limit reached — resuming in ${formatTime(retryInSeconds)}`,
+            eta: null,
+            rateLimitRetryAfter: retryInSeconds,
+            errors: errors.slice(-10)
+          });
+          
+          // Wait until retry time (scheduleResume will fire and set state to RUNNING)
+          await new Promise(resolve => setTimeout(resolve, retryInMs));
+          
+          // After wait, check if still paused (scheduleResume should have cleared paused flag)
+          const stillPaused = this.rateLimitStatus.get(syncJobId)?.paused;
+          if (stillPaused) {
+            console.log(`⚠️ [SyncService] Still paused after wait, clearing manually for job ${syncJobId}`);
+            this.clearRateLimitStatus(syncJobId);
           }
           
-          // Rate limit period has passed, clear status
-          this.clearRateLimitStatus(syncJobId);
+          console.log(`🔄 [SyncService] Resuming product ${i + 1}/${totalProducts} after rate limit wait`);
         } else {
-          // Rate limit period has passed, clear status
+          // Retry time has passed, clear status
           this.clearRateLimitStatus(syncJobId);
         }
       }
@@ -585,6 +692,15 @@ class SyncService {
         const syncEndTime = Date.now();
         completedTimes.push(syncEndTime - syncStartTime);
         
+        // Success! Clear retryAt now that we've successfully processed a request
+        const rateLimitInfo = this.rateLimitStatus.get(syncJobId);
+        if (rateLimitInfo && rateLimitInfo.retryAt && !rateLimitInfo.paused) {
+          // We successfully processed a request after resume - clear retryAt
+          rateLimitInfo.retryAt = null;
+          rateLimitInfo.nextRetryAt = null;
+          console.log(`✅ [SyncService] Successfully processed product after resume, cleared retryAt for job ${syncJobId}`);
+        }
+        
         // Keep only last 10 completion times for rolling average
         if (completedTimes.length > 10) {
           completedTimes.shift();
@@ -614,43 +730,169 @@ class SyncService {
           errors: errors.slice(-10)
         });
       } catch (error) {
-        failedCount++;
-        const errorInfo = {
-          itemId: ebayProduct.ebay_item_id,
-          title: ebayProduct.title || 'Unknown',
-          error: error.message
-        };
-        errors.push(errorInfo);
+        const now = Date.now();
         
-        // Update progress: product failed
-        this.updateSyncProgress(syncJobId, {
-          jobId: syncJobId,
-          total: totalProducts,
-          completed: syncedCount,
-          failed: failedCount,
-          percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
-          status: 'in_progress',
-          currentStep: `Failed: ${ebayProduct.title || ebayProduct.ebay_item_id}`,
-          eta: this.calculateETA(syncedCount + failedCount, totalProducts, completedTimes, startTime),
-          errors: errors.slice(-10)
-        });
+        // Check if this is a rate limit error
+        const isRateLimitError = error.message && (
+          error.message.includes('rate limit') || 
+          error.message.includes('429') || 
+          error.message.includes('Too Many Requests') ||
+          error.status === 429 ||
+          (error.response && error.response.status === 429)
+        );
         
-        console.error(`Error syncing product ${ebayProduct.ebay_item_id}:`, error);
+        const errorCode = (error.response && error.response.status) || error.status || null;
+        const errorMessage = error.message || (error.response && error.response.statusText) || 'Unknown error';
+        
+        if (isRateLimitError) {
+          // Rate limit error - immediately compute new retryAt and transition to PAUSED_RATE_LIMIT
+          // The rate limiter callback should have already been called with retryAt timestamp
+          // But if not, we need to compute it here
+          const retryAfterHeader = error.response?.headers?.['retry-after'] || 
+                                   error.response?.headers?.['Retry-After'] || 
+                                   60; // Default 60 seconds
+          
+          // Get retryAt from rate limiter callback (if available) or compute it
+          const rateLimitInfo = this.rateLimitStatus.get(syncJobId);
+          let retryAt;
+          
+          if (rateLimitInfo && rateLimitInfo.retryAt) {
+            // Use retryAt from rate limiter (sliding window calculation)
+            retryAt = rateLimitInfo.retryAt;
+          } else {
+            // Fallback: compute retryAt from retry-after header
+            const retryAfterMs = parseInt(retryAfterHeader) * 1000;
+            retryAt = now + retryAfterMs + 1500; // Add safety buffer
+          }
+          
+          const retryAfterMs = Math.max(0, retryAt - now);
+          const retryAfterSeconds = Math.ceil(retryAfterMs / 1000);
+          
+          // Set paused state immediately
+          this.rateLimitStatus.set(syncJobId, {
+            retryAfter: retryAfterSeconds,
+            retryAfterMs: retryAfterMs,
+            paused: true,
+            pausedAt: now,
+            nextRetryAt: retryAt,
+            retryAt: retryAt,
+            retryAttemptCount: (rateLimitInfo?.retryAttemptCount || 0) + 1,
+            scheduledResume: false // Will schedule new resume
+          });
+          
+          // Schedule new resume at retryAt
+          this.scheduleResume(syncJobId, retryAt);
+          
+          // Update progress to PAUSED_RATE_LIMIT state immediately
+          this.updateSyncProgress(syncJobId, {
+            jobId: syncJobId,
+            total: totalProducts,
+            completed: syncedCount,
+            failed: failedCount, // Don't increment yet - will retry
+            percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
+            status: 'retry_scheduled',
+            state: 'PAUSED_RATE_LIMIT', // Explicit state
+            rateLimited: true,
+            nextRetryAt: retryAt,
+            retryAt: retryAt,
+            retryInMs: retryAfterMs,
+            retryInSeconds: retryAfterSeconds,
+            lastAttemptAt: now,
+            lastErrorCode: errorCode,
+            lastErrorMessage: errorMessage,
+            currentStep: `Sharetribe rate limit reached — resuming in ${formatTime(retryAfterSeconds)}`,
+            eta: null,
+            errors: errors.slice(-10)
+          });
+          
+          console.warn(`⏸️ [SyncService] Rate limit error for product ${ebayProduct.ebay_item_id}, transitioned to PAUSED_RATE_LIMIT, retryAt: ${new Date(retryAt).toISOString()}`);
+          
+          // Break out of loop - will resume at retryAt
+          break;
+        } else {
+          // Non-rate-limit error - mark as failed
+          failedCount++;
+          
+          const errorInfo = {
+            itemId: ebayProduct.ebay_item_id,
+            title: ebayProduct.title || 'Unknown',
+            error: errorMessage
+          };
+          errors.push(errorInfo);
+          
+          // Update progress: product failed
+          this.updateSyncProgress(syncJobId, {
+            jobId: syncJobId,
+            total: totalProducts,
+            completed: syncedCount,
+            failed: failedCount,
+            percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
+            status: 'in_progress',
+            state: 'running',
+            currentStep: `Failed: ${ebayProduct.title || ebayProduct.ebay_item_id}`,
+            eta: this.calculateETA(syncedCount + failedCount, totalProducts, completedTimes, startTime),
+            lastAttemptAt: now,
+            lastErrorCode: errorCode,
+            lastErrorMessage: errorMessage,
+            errors: errors.slice(-10)
+          });
+          
+          console.error(`❌ Error syncing product ${ebayProduct.ebay_item_id}:`, error);
+        }
       }
     }
 
     // Final progress update
-    this.updateSyncProgress(syncJobId, {
-      jobId: syncJobId,
-      total: totalProducts,
-      completed: syncedCount,
-      failed: failedCount,
-      percent: 100,
-      status: 'completed',
-      currentStep: 'Sync completed',
-      eta: 0,
-      errors: errors
-    });
+    // Only mark COMPLETED if processed === total (100%)
+    // Otherwise, keep RUNNING or PAUSED so job can auto-continue
+    const finalProcessed = syncedCount + failedCount; // All items have been attempted
+    const finalPercent = totalProducts > 0 ? Math.round((finalProcessed / totalProducts) * 100) : 100;
+    const remaining = totalProducts - finalProcessed;
+    
+    // Sanity check: Only COMPLETED if processed === total (100%)
+    // If processed < total, keep job active (RUNNING or PAUSED) so it can auto-continue
+    if (finalProcessed === totalProducts) {
+      // All items processed - mark as COMPLETED
+      this.updateSyncProgress(syncJobId, {
+        jobId: syncJobId,
+        total: totalProducts, // Locked total (set at job start)
+        completed: syncedCount,
+        failed: failedCount,
+        processed: finalProcessed,
+        remaining: 0,
+        percent: 100,
+        status: 'completed',
+        state: 'COMPLETED',
+        currentStep: 'Sync completed',
+        eta: 0,
+        errors: errors
+      });
+    } else {
+      // Not fully processed - keep job active (will auto-continue)
+      // Set to PAUSED with resumeAt so UI shows countdown
+      const resumeAt = Date.now() + 5000; // Resume in 5s
+      this.updateSyncProgress(syncJobId, {
+        jobId: syncJobId,
+        total: totalProducts,
+        completed: syncedCount,
+        failed: failedCount,
+        processed: finalProcessed,
+        remaining: remaining,
+        percent: finalPercent,
+        status: 'retry_scheduled',
+        state: 'PAUSED', // Keep PAUSED so job can auto-continue
+        nextRetryAt: resumeAt,
+        retryAt: resumeAt,
+        currentStep: 'Sync will continue automatically',
+        eta: null,
+        errors: errors
+      });
+      
+      // Schedule auto-resume
+      this.scheduleResume(syncJobId, resumeAt);
+      console.log(`⏸️ [SyncService] Job ${syncJobId} not fully processed (${finalProcessed}/${totalProducts}), keeping active and scheduling auto-resume`);
+      return; // Don't unregister job - it will continue
+    }
     
     // Unregister sync job and rate limit callback
     rateLimiter.unregisterSyncJob(syncJobId);
@@ -699,40 +941,245 @@ class SyncService {
   
   /**
    * Handle rate limit event
+   * retryAfter can be retryAt timestamp (epoch ms) or milliseconds/seconds
+   * Uses sliding window calculation: retryAt = oldestRequestTimestamp + 60000 + 1500ms
    */
-  handleRateLimit(jobId, retryAfter) {
+  handleRateLimit(jobId, retryAfter, errorCode = 429, errorMessage = 'Rate limit exceeded') {
     const progress = this.getSyncProgress(jobId);
     if (progress) {
+      const now = Date.now();
+      
+      // If retryAfter is a large number (> 1000000), treat it as retryAt timestamp (epoch ms)
+      // Otherwise, treat as wait time in ms or seconds
+      let retryAt;
+      let retryAfterMs;
+      
+      if (retryAfter > 1000000) {
+        // This is a retryAt timestamp (epoch ms)
+        retryAt = retryAfter;
+        retryAfterMs = Math.max(0, retryAt - now);
+      } else {
+        // This is wait time (ms or seconds)
+        retryAfterMs = retryAfter > 1000 ? retryAfter : retryAfter * 1000;
+        retryAt = now + retryAfterMs;
+      }
+      
+      const retryAfterSeconds = Math.ceil(retryAfterMs / 1000);
+      const retryAttemptCount = (progress.retryAttemptCount || 0) + 1;
+      
       this.rateLimitStatus.set(jobId, {
-        retryAfter: retryAfter,
+        retryAfter: retryAfterSeconds,
+        retryAfterMs: retryAfterMs,
         paused: true,
-        pausedAt: Date.now()
+        pausedAt: now,
+        nextRetryAt: retryAt,
+        retryAt: retryAt, // Explicit retryAt timestamp (from sliding window)
+        retryAttemptCount: retryAttemptCount,
+        scheduledResume: false
       });
       
-      // Update progress to show rate limit status
+      // Update progress to PAUSED_RATE_LIMIT state
       this.updateSyncProgress(jobId, {
         ...progress,
-        status: 'rate_limited',
-        currentStep: `Rate limit hit - waiting ${retryAfter}s for API limit refresh...`,
-        rateLimitRetryAfter: retryAfter
+        status: 'retry_scheduled',
+        state: 'PAUSED_RATE_LIMIT',
+        rateLimited: true,
+        nextRetryAt: retryAt,
+        retryAt: retryAt,
+        retryInMs: retryAfterMs,
+        retryInSeconds: retryAfterSeconds,
+        retryAttemptCount: retryAttemptCount,
+        lastAttemptAt: now,
+        lastErrorCode: errorCode,
+        lastErrorMessage: errorMessage,
+        currentStep: `Sharetribe rate limit reached — resuming in ${formatTime(retryAfterSeconds)}`,
+        rateLimitRetryAfter: retryAfterSeconds
       });
+      
+      // Schedule backend resume at retryAt (backend-owned)
+      this.scheduleResume(jobId, retryAt);
+      
+      console.log(`⏸️ [SyncService] Rate limit hit for job ${jobId}, scheduled retry at ${new Date(retryAt).toISOString()} (in ${retryAfterSeconds}s / ${retryAfterMs}ms)`);
     }
   }
   
   /**
-   * Clear rate limit status
+   * Schedule backend resume at retryAt timestamp (backend-owned)
+   * When resume fires, sets state to RUNNING and clears pause flag
+   * If job is not fully processed, it will continue automatically
+   */
+  scheduleResume(jobId, retryAt) {
+    const rateLimitInfo = this.rateLimitStatus.get(jobId);
+    if (!rateLimitInfo) {
+      // Create rate limit info if it doesn't exist (for incomplete jobs)
+      this.rateLimitStatus.set(jobId, {
+        paused: true,
+        pausedAt: Date.now(),
+        retryAt: retryAt,
+        nextRetryAt: retryAt,
+        scheduledResume: false
+      });
+    }
+    
+    const currentRateLimitInfo = this.rateLimitStatus.get(jobId);
+    if (currentRateLimitInfo.scheduledResume) {
+      return; // Already scheduled
+    }
+    
+    const now = Date.now();
+    const waitMs = Math.max(0, retryAt - now);
+    
+    console.log(`⏰ [SyncService] Scheduling resume for job ${jobId} in ${Math.ceil(waitMs / 1000)}s (at ${new Date(retryAt).toISOString()})`);
+    
+    // Mark as scheduled
+    currentRateLimitInfo.scheduledResume = true;
+    
+    // Store timeout ID for cleanup
+    if (!this.resumeTimeouts) {
+      this.resumeTimeouts = new Map();
+    }
+    
+    // Clear any existing timeout for this job
+    if (this.resumeTimeouts.has(jobId)) {
+      clearTimeout(this.resumeTimeouts.get(jobId));
+    }
+    
+    // Schedule resume using setTimeout
+    const timeoutId = setTimeout(() => {
+      console.log(`🔄 [SyncService] Resume fired for job ${jobId} at ${new Date().toISOString()}`);
+      
+      const currentProgress = this.getSyncProgress(jobId);
+      const currentRateLimitInfo = this.rateLimitStatus.get(jobId);
+      
+      if (currentProgress) {
+        // Check if job is fully processed
+        const processed = (currentProgress.completed || 0) + (currentProgress.failed || 0);
+        const total = currentProgress.total || 0;
+        
+        if (processed < total) {
+          // Not fully processed - continue sync
+          // Update state to RUNNING
+          this.updateSyncProgress(jobId, {
+            ...currentProgress,
+            status: 'in_progress',
+            state: 'RUNNING',
+            rateLimited: false,
+            nextRetryAt: null,
+            retryAt: null,
+            retryInMs: null,
+            currentStep: 'Resuming sync...'
+          });
+          
+          // Clear paused flag
+          if (currentRateLimitInfo) {
+            currentRateLimitInfo.paused = false;
+            currentRateLimitInfo.resumedAt = Date.now();
+          }
+          
+          console.log(`✅ [SyncService] Job ${jobId} resumed, state set to RUNNING (${processed}/${total} processed)`);
+          
+          // Continue sync by calling syncProducts again with remaining items
+          // Get remaining product IDs from database
+          const dbInstance = db.getDb();
+          dbInstance.all(
+            `SELECT ebay_item_id FROM products WHERE tenant_id = ? AND user_id = ? AND (synced = 0 OR sharetribe_listing_id IS NULL)`,
+            [1, currentProgress.sharetribeUserId || null],
+            async (err, rows) => {
+              if (err) {
+                console.error(`❌ [SyncService] Error fetching remaining products for job ${jobId}:`, err);
+                return;
+              }
+              
+              if (rows && rows.length > 0) {
+                const remainingItemIds = rows.map(r => r.ebay_item_id);
+                console.log(`🔄 [SyncService] Continuing sync for job ${jobId} with ${remainingItemIds.length} remaining products`);
+                
+                // Continue sync with remaining items
+                try {
+                  await this.syncProducts(1, remainingItemIds, currentProgress.sharetribeUserId, jobId);
+                } catch (error) {
+                  console.error(`❌ [SyncService] Error continuing sync for job ${jobId}:`, error);
+                }
+              } else {
+                // All products processed - mark as COMPLETED
+                this.updateSyncProgress(jobId, {
+                  ...currentProgress,
+                  status: 'completed',
+                  state: 'COMPLETED',
+                  currentStep: 'Sync completed',
+                  percent: 100
+                });
+                
+                // Unregister job
+                rateLimiter.unregisterSyncJob(jobId);
+                rateLimiter.unregisterRateLimitCallback(jobId);
+                this.clearRateLimitStatus(jobId);
+              }
+            }
+          );
+        } else {
+          // Fully processed - mark as COMPLETED
+          this.updateSyncProgress(jobId, {
+            ...currentProgress,
+            status: 'completed',
+            state: 'COMPLETED',
+            currentStep: 'Sync completed',
+            percent: 100
+          });
+          
+          // Unregister job
+          rateLimiter.unregisterSyncJob(jobId);
+          rateLimiter.unregisterRateLimitCallback(jobId);
+          this.clearRateLimitStatus(jobId);
+        }
+      } else {
+        console.log(`⚠️ [SyncService] Job ${jobId} not found or already completed`);
+      }
+      
+      // Clean up timeout
+      this.resumeTimeouts.delete(jobId);
+    }, waitMs);
+    
+    this.resumeTimeouts.set(jobId, timeoutId);
+  }
+  
+  /**
+   * Clear rate limit status and resume sync
    */
   clearRateLimitStatus(jobId) {
+    const rateLimitInfo = this.rateLimitStatus.get(jobId);
     this.rateLimitStatus.delete(jobId);
+    
     const progress = this.getSyncProgress(jobId);
-    if (progress && progress.status === 'rate_limited') {
+    if (progress && (progress.status === 'rate_limited' || progress.status === 'retry_scheduled' || progress.state === 'retry_scheduled')) {
+      const now = Date.now();
       this.updateSyncProgress(jobId, {
         ...progress,
         status: 'in_progress',
+        state: 'running',
+        rateLimited: false,
+        nextRetryAt: null,
+        retryInSeconds: null,
+        lastAttemptAt: now,
         currentStep: 'Resuming sync...',
-        rateLimitRetryAfter: null
+        rateLimitRetryAfter: null // Keep for backward compatibility
       });
+      
+      console.log(`▶️ [SyncService] Rate limit cleared for job ${jobId}, resuming sync`);
     }
+  }
+  
+  /**
+   * Check if it's time to retry based on nextRetryAt
+   */
+  shouldRetryNow(jobId) {
+    const rateLimitInfo = this.rateLimitStatus.get(jobId);
+    if (!rateLimitInfo || !rateLimitInfo.paused) {
+      return false;
+    }
+    
+    const now = Date.now();
+    return now >= rateLimitInfo.nextRetryAt;
   }
   
   /**
