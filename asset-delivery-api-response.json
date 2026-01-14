@@ -1,0 +1,79 @@
+{
+  "data": {
+    "listingTypes": [
+      {
+        "transactionProcess": {
+          "name": "default-purchase",
+          "alias": "default-purchase/release-1"
+        },
+        "defaultListingFields": {
+          "description": true,
+          "availability": false,
+          "payoutDetails": true,
+          "images": true,
+          "pickup": true,
+          "title": true,
+          "shipping": true,
+          "location": false,
+          "price": true,
+          "stock": false
+        },
+        "id": "list-new-item",
+        "label": "Sale (You keep 90%)",
+        "unitType": "item",
+        "stockType": "oneItem"
+      },
+      {
+        "transactionProcess": {
+          "name": "default-inquiry",
+          "alias": "default-inquiry/release-1"
+        },
+        "defaultListingFields": {
+          "description": true,
+          "availability": false,
+          "payoutDetails": false,
+          "images": true,
+          "pickup": false,
+          "title": true,
+          "shipping": false,
+          "location": true,
+          "price": true,
+          "stock": false
+        },
+        "label": "Sale ($10 listing fee)",
+        "id": "bikes",
+        "unitType": "inquiry",
+        "stockType": "oneItem"
+      },
+      {
+        "transactionProcess": {
+          "name": "default-booking",
+          "alias": "default-booking/release-1"
+        },
+        "defaultListingFields": {
+          "description": true,
+          "availability": true,
+          "payoutDetails": true,
+          "images": true,
+          "pickup": false,
+          "title": true,
+          "shipping": false,
+          "location": true,
+          "price": true,
+          "stock": false
+        },
+        "priceVariations": {
+          "enabled": true
+        },
+        "availabilityType": "multipleSeats",
+        "unitType": "fixed",
+        "label": "Coaching",
+        "id": "coaching"
+      }
+    ]
+  },
+  "meta": {
+    "version": "Adsf4FXZ35spPX2izY0pBw"
+  }
+}
+

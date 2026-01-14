@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { RefreshCw, Upload, CheckCircle, XCircle, AlertCircle, FileUp, X, Eye } from 'lucide-react';
-import { getProducts, refreshProducts, syncProducts, previewCSV, uploadCSV, removeProducts, getShareTribeUsers, previewPayload, applyEbayProductMappings } from '../services/api';
+import { getProducts, refreshProducts, syncProducts, previewCSV, uploadCSV, removeProducts, getShareTribeUsers, previewPayload, applyEbayProductMappings, getActiveSyncJob } from '../services/api';
 import CSVColumnMapping from './CSVColumnMapping';
 import ErrorBoundary from './ErrorBoundary';
+import SyncProgressModal from './SyncProgressModal';
 
 const ProductsTab = () => {
   const [products, setProducts] = useState([]);
@@ -22,12 +23,49 @@ const ProductsTab = () => {
   const [showPayloadPreview, setShowPayloadPreview] = useState(false);
   const [payloadPreviewData, setPayloadPreviewData] = useState(null);
   const [previewingPayload, setPreviewingPayload] = useState(false);
+  const [syncJobId, setSyncJobId] = useState(null);
+  const [showSyncProgress, setShowSyncProgress] = useState(false);
+  const [isSyncInProgress, setIsSyncInProgress] = useState(false);
   const fileInputRef = useRef(null);
 
   useEffect(() => {
     loadProducts();
     loadShareTribeUsers();
+    checkActiveSyncJob();
   }, [activeTab, searchTerm, selectedShareTribeUser]);
+
+  const checkActiveSyncJob = async () => {
+    if (!selectedShareTribeUser) {
+      setSyncJobId(null);
+      setIsSyncInProgress(false);
+      return;
+    }
+    
+    try {
+      const response = await getActiveSyncJob(selectedShareTribeUser);
+      if (response.data && response.data.active && response.data.jobId) {
+        console.log('✅ [Frontend] Active sync job found:', response.data.jobId);
+        setSyncJobId(response.data.jobId);
+        setIsSyncInProgress(true);
+        // Don't auto-show modal, but set jobId so it can be attached to if user clicks sync
+      } else {
+        console.log('📋 [Frontend] No active sync job');
+        setSyncJobId(null);
+        setIsSyncInProgress(false);
+      }
+    } catch (error) {
+      // 404 means the endpoint doesn't exist (server might need restart)
+      // Other errors are also non-critical - just log them
+      if (error.response?.status === 404) {
+        console.warn('⚠️ [Frontend] /api/sync/active endpoint not found (404) - server may need restart');
+      } else {
+        console.error('❌ [Frontend] Error checking active sync job:', error);
+      }
+      // Don't show error to user - just log it
+      setSyncJobId(null);
+      setIsSyncInProgress(false);
+    }
+  };
 
   const loadShareTribeUsers = async () => {
     try {
@@ -327,32 +365,168 @@ const ProductsTab = () => {
       return;
     }
 
-    setSyncing(true);
+    // Check if there's already an active sync job - if so, just open the modal
+    if (syncJobId && isSyncInProgress) {
+      console.log('📋 [Frontend] Active sync job detected, opening progress modal for:', syncJobId);
+      setShowSyncProgress(true);
+      return;
+    }
+
+    // Double-check with API if state doesn't have it (race condition protection)
     try {
-      const result = await syncProducts(itemIds, selectedShareTribeUser);
-      const { synced, failed, errors } = result.data;
+      const activeJobResponse = await getActiveSyncJob(selectedShareTribeUser);
+      if (activeJobResponse.data && activeJobResponse.data.active && activeJobResponse.data.jobId) {
+        console.log('📋 [Frontend] Active sync job found via API, opening progress modal for:', activeJobResponse.data.jobId);
+        setSyncJobId(activeJobResponse.data.jobId);
+        setIsSyncInProgress(true);
+        setShowSyncProgress(true);
+        return;
+      }
+    } catch (error) {
+      console.log('📋 [Frontend] No active job found (or error checking):', error);
+      // Continue with new sync
+    }
+
+    setSyncing(true);
+    
+    // Show progress modal IMMEDIATELY, before making the API call
+    // This ensures the modal appears right away
+    setShowSyncProgress(true);
+    console.log('📋 [Frontend] Progress modal shown immediately');
+    console.log('📋 [Frontend] syncJobId state before API call:', syncJobId);
+    
+    try {
+      // Start sync (returns immediately with jobId)
+      console.log('📋 [Frontend] Calling syncProducts API...');
+      console.log('📋 [Frontend] Request params:', { itemIds, selectedShareTribeUser });
       
-      if (failed > 0 && errors && errors.length > 0) {
-        // Show all errors in alert
-        const errorDetails = errors.map((e, idx) => `${idx + 1}. ${e.itemId}: ${e.error}`).join('\n');
-        alert(`Sync completed!\n\nSynced: ${synced}\nFailed: ${failed}\n\nErrors:\n${errorDetails}`);
-        console.error('Sync errors:', errors);
-        // Also log each error individually for easier debugging
-        errors.forEach((e, idx) => {
-          console.error(`Error ${idx + 1} - ${e.itemId}:`, e.error);
+      let result;
+      try {
+        console.log('📋 [Frontend] About to call syncProducts...');
+        console.log('📋 [Frontend] API base URL:', '/api');
+        console.log('📋 [Frontend] Full request URL will be: /api/sync');
+        
+        const startTime = Date.now();
+        result = await syncProducts(itemIds, selectedShareTribeUser);
+        const endTime = Date.now();
+        console.log(`✅ [Frontend] Sync response received after ${endTime - startTime}ms:`, result);
+        console.log('✅ [Frontend] Sync response.data:', result.data);
+        console.log('✅ [Frontend] Sync response.status:', result.status);
+        console.log('✅ [Frontend] Sync response.headers:', result.headers);
+      } catch (apiError) {
+        console.error('❌ [Frontend] API call failed:', apiError);
+        console.error('❌ [Frontend] API error details:', {
+          message: apiError.message,
+          code: apiError.code,
+          response: apiError.response,
+          responseData: apiError.response?.data,
+          responseStatus: apiError.response?.status,
+          responseHeaders: apiError.response?.headers,
+          stack: apiError.stack
         });
-      } else {
-        alert(`Sync completed! Synced: ${synced}, Failed: ${failed}`);
+        throw apiError; // Re-throw to be caught by outer catch
       }
       
-      await loadProducts();
-      setSelectedProducts(new Set());
+      // Extract jobId from response
+      if (result.data && result.data.jobId) {
+        const jobIdValue = result.data.jobId;
+        const isAlreadyRunning = result.data.alreadyRunning || false;
+        
+        console.log('✅ [Frontend] Found jobId in response.data.jobId:', jobIdValue);
+        console.log('✅ [Frontend] Already running:', isAlreadyRunning);
+        
+        setSyncJobId(jobIdValue);
+        console.log('✅ [Frontend] syncJobId state updated to:', jobIdValue);
+        
+        // If job was already running, we're just attaching to it - success path
+        if (isAlreadyRunning) {
+          console.log('📋 [Frontend] Attaching to existing sync job - success path');
+          setIsSyncInProgress(true);
+          setSyncing(false); // Stop the syncing state since we're just viewing
+          // Don't return early - let the modal handle the progress display
+          // The modal will poll for progress using the jobId
+          return; // Exit early - this is success, not error
+        }
+        
+        // New job started - ensure isSyncInProgress is false
+        setIsSyncInProgress(false);
+      } else if (result.data && result.data.message) {
+        // Try to extract jobId from message
+        const match = result.data.message.match(/sync_[a-z0-9_]+/i);
+        if (match) {
+          setSyncJobId(match[0]);
+          console.log('✅ Progress modal jobId extracted from message:', match[0]);
+        } else {
+          console.warn('⚠️ No jobId found in response, modal will show but may not track progress');
+        }
+      } else {
+        console.warn('⚠️ [Frontend] Unexpected response structure:', result.data);
+        console.warn('⚠️ [Frontend] Full result object:', result);
+        // Check if it's the old synchronous format
+        if (result.data && result.data.synced !== undefined) {
+          // Old format - sync completed immediately
+          setShowSyncProgress(false);
+          const { synced, failed, errors } = result.data;
+          if (failed > 0 && errors && errors.length > 0) {
+            const errorDetails = errors.map((e, idx) => `${idx + 1}. ${e.itemId}: ${e.error}`).join('\n');
+            alert(`Sync completed!\n\nSynced: ${synced}\nFailed: ${failed}\n\nErrors:\n${errorDetails}`);
+          } else {
+            alert(`Sync completed! Synced: ${synced}, Failed: ${failed}`);
+          }
+          await loadProducts();
+          setSelectedProducts(new Set());
+        } else {
+          console.error('❌ [Frontend] No jobId found in response and not old format');
+          console.error('❌ [Frontend] Response keys:', Object.keys(result.data || {}));
+        }
+      }
     } catch (error) {
-      console.error('Error syncing products:', error);
+      console.error('❌ [Frontend] Error syncing products:', error);
+      console.error('❌ [Frontend] Error details:', {
+        message: error.message,
+        response: error.response,
+        responseData: error.response?.data,
+        responseStatus: error.response?.status,
+        stack: error.stack
+      });
+      
+      // Check if this is a "job already running" scenario (HTTP 409 or error message contains it)
+      const isAlreadyRunningError = 
+        error.response?.status === 409 ||
+        (error.response?.data?.jobId && error.response?.data?.alreadyRunning) ||
+        (error.response?.data?.error && error.response?.data?.error.includes('already in progress')) ||
+        (error.message && error.message.includes('already in progress'));
+      
+      if (isAlreadyRunningError) {
+        // This is NOT a real error - it's a "resume existing job" scenario
+        const existingJobId = error.response?.data?.jobId || syncJobId;
+        if (existingJobId) {
+          console.log('📋 [Frontend] Treating "already running" as success - attaching to job:', existingJobId);
+          setSyncJobId(existingJobId);
+          setShowSyncProgress(true); // Ensure modal is shown
+          return; // Exit early - this is success, not error
+        }
+      }
+      
+      // Only show error for real failures
       alert('Failed to sync products: ' + (error.response?.data?.error || error.message));
+      setShowSyncProgress(false); // Close modal on real error
     } finally {
       setSyncing(false);
     }
+  };
+
+  const handleSyncProgressClose = async () => {
+    setShowSyncProgress(false);
+    setSyncJobId(null);
+    // Reload products to show updated sync status
+    await loadProducts();
+    setSelectedProducts(new Set());
+  };
+
+  const handleRetryFailed = async (failedItemIds) => {
+    // Retry sync with only the failed items
+    await handleSync(failedItemIds);
   };
 
   const handleRemoveProducts = async (itemIds = null) => {
@@ -592,7 +766,8 @@ const ProductsTab = () => {
   });
 
   return (
-    <div className="space-y-6">
+    <ErrorBoundary>
+      <div className="space-y-6">
       {/* ShareTribe User Selection */}
       <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
         <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -666,14 +841,24 @@ const ProductsTab = () => {
             <Eye size={18} className={previewingPayload ? 'animate-spin' : ''} />
             <span>Preview Payload</span>
           </button>
-          <button
-            onClick={() => handleSync(null)}
-            disabled={syncing || products.length === 0}
-            className="flex items-center space-x-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50"
-          >
-            <Upload size={18} className={syncing ? 'animate-spin' : ''} />
-            <span>Sync All</span>
-          </button>
+          {isSyncInProgress && syncJobId ? (
+            <button
+              onClick={() => handleSync(products.map(p => p.ebay_item_id))}
+              className="flex items-center space-x-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+            >
+              <Upload size={18} />
+              <span>View Sync In Progress</span>
+            </button>
+          ) : (
+            <button
+              onClick={() => handleSync(products.map(p => p.ebay_item_id))}
+              disabled={syncing || products.length === 0}
+              className="flex items-center space-x-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50"
+            >
+              <Upload size={18} className={syncing ? 'animate-spin' : ''} />
+              <span>Sync All</span>
+            </button>
+          )}
           {selectedProducts.size > 0 && (
             <>
               <button
@@ -690,7 +875,7 @@ const ProductsTab = () => {
                 className="flex items-center space-x-2 px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50"
               >
                 <Upload size={18} className={syncing ? 'animate-spin' : ''} />
-                <span>Sync Selected ({selectedProducts.size})</span>
+                <span>{syncJobId ? 'Sync in Progress' : `Sync Selected (${selectedProducts.size})`}</span>
               </button>
             </>
           )}
@@ -1004,7 +1189,17 @@ const ProductsTab = () => {
           </div>
         </div>
       )}
-    </div>
+
+      {/* Sync Progress Modal - Only show if showSyncProgress is true AND jobId is set */}
+      {showSyncProgress && syncJobId && (
+        <SyncProgressModal
+          jobId={syncJobId}
+          onClose={handleSyncProgressClose}
+          onRetryFailed={handleRetryFailed}
+        />
+      )}
+      </div>
+    </ErrorBoundary>
   );
 };
 

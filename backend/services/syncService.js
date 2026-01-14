@@ -1,9 +1,127 @@
 const db = require('../config/database');
 const eBayService = require('./ebayService');
 const ShareTribeService = require('./sharetribeService');
+const rateLimiter = require('../utils/sharetribeRateLimiter');
 
 class SyncService {
-  async syncProducts(tenantId = 1, itemIds = null, sharetribeUserId = null) {
+  constructor() {
+    // Store progress for active sync jobs
+    this.syncProgress = new Map();
+    
+    // Track rate limit status
+    this.rateLimitStatus = new Map(); // jobId -> { retryAfter: seconds, paused: boolean }
+  }
+  
+  /**
+   * Get progress for a sync job
+   */
+  getSyncProgress(jobId) {
+    const progress = this.syncProgress.get(jobId) || null;
+    if (progress) {
+      console.log(`📋 [SyncService] Getting progress for job ${jobId}:`, {
+        total: progress.total,
+        completed: progress.completed,
+        failed: progress.failed,
+        percent: progress.percent,
+        status: progress.status,
+        currentStep: progress.currentStep
+      });
+    } else {
+      console.log(`📋 [SyncService] No progress found for job ${jobId}`);
+    }
+    return progress;
+  }
+  
+  /**
+   * Update progress for a sync job
+   */
+  updateSyncProgress(jobId, progress) {
+    const progressData = {
+      ...progress,
+      lastUpdate: Date.now()
+    };
+    this.syncProgress.set(jobId, progressData);
+    console.log(`📋 [SyncService] Progress updated for job ${jobId}:`, {
+      total: progressData.total,
+      completed: progressData.completed,
+      failed: progressData.failed,
+      percent: progressData.percent,
+      status: progressData.status,
+      currentStep: progressData.currentStep
+    });
+  }
+  
+  /**
+   * Clear progress for a completed/failed sync job
+   */
+  clearSyncProgress(jobId) {
+    this.syncProgress.delete(jobId);
+  }
+  
+  /**
+   * Get active sync job ID (if any)
+   */
+  getActiveSyncJobId() {
+    return rateLimiter.getActiveSyncJobId();
+  }
+  
+  /**
+   * Get active sync job progress (if any)
+   */
+  getActiveSyncJobProgress() {
+    const activeJobId = rateLimiter.getActiveSyncJobId();
+    if (!activeJobId) {
+      return null;
+    }
+    
+    const progress = this.getSyncProgress(activeJobId);
+    if (!progress) {
+      return null;
+    }
+    
+    return {
+      jobId: activeJobId,
+      ...progress
+    };
+  }
+  
+  async syncProducts(tenantId = 1, itemIds = null, sharetribeUserId = null, jobId = null) {
+    // Generate job ID if not provided
+    const syncJobId = jobId || `sync_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    // Note: We don't check for active jobs here anymore - the API route handles it
+    // This allows the API route to return the existing jobId instead of throwing an error
+    
+    // Check if there's already an active job (safety check - API route should prevent this)
+    const existingJobId = rateLimiter.getActiveSyncJobId();
+    if (existingJobId && existingJobId !== syncJobId) {
+      // This should never happen if API route is working correctly, but handle gracefully
+      console.warn(`⚠️ [SyncService] Attempted to start sync ${syncJobId} but ${existingJobId} is already active`);
+      // Return the existing job's progress instead of throwing
+      const existingProgress = this.getSyncProgress(existingJobId);
+      if (existingProgress) {
+        return {
+          success: true,
+          synced: existingProgress.completed,
+          failed: existingProgress.failed,
+          errors: existingProgress.errors || [],
+          jobId: existingJobId,
+          alreadyRunning: true
+        };
+      }
+      // If no progress found, throw (shouldn't happen)
+      throw new Error(`A sync job (${existingJobId}) is already in progress. Please wait for it to complete.`);
+    }
+    
+    // Register this sync job
+    rateLimiter.registerSyncJob(syncJobId);
+    
+    // Register rate limit callback
+    rateLimiter.registerRateLimitCallback(syncJobId, (retryAfter) => {
+      this.handleRateLimit(syncJobId, retryAfter);
+    });
+    
+    try {
     const dbInstance = db.getDb();
     
     // Get API configuration (shared credentials)
@@ -213,12 +331,112 @@ class SyncService {
       });
     }
 
-    // Transform and sync each product
+    // Initialize progress tracking
+    const totalProducts = productsToSync.length;
+    console.log(`📋 [SyncService] Products fetched for job ${syncJobId}: ${totalProducts} products`);
+    console.log(`📋 [SyncService] productsToSync array length:`, productsToSync.length);
+    console.log(`📋 [SyncService] productsToSync sample:`, productsToSync.slice(0, 2));
+    
+    if (totalProducts === 0) {
+      // No products to sync - update progress and return
+      console.log(`⚠️ [SyncService] No products to sync for job ${syncJobId}`);
+      this.updateSyncProgress(syncJobId, {
+        jobId: syncJobId,
+        total: 0,
+        completed: 0,
+        failed: 0,
+        percent: 100,
+        status: 'completed',
+        currentStep: 'No products to sync',
+        eta: 0,
+        errors: []
+      });
+      rateLimiter.unregisterSyncJob(syncJobId);
+      rateLimiter.unregisterRateLimitCallback(syncJobId);
+      return {
+        success: true,
+        synced: 0,
+        failed: 0,
+        errors: [],
+        jobId: syncJobId
+      };
+    }
+    
     let syncedCount = 0;
     let failedCount = 0;
     const errors = [];
+    const startTime = Date.now();
+    const completedTimes = []; // Track completion times for ETA calculation
+    
+    // Update progress with actual product count (progress was initialized in API route)
+    console.log(`📋 [SyncService] Updating progress for job ${syncJobId} with ${totalProducts} products`);
+    this.updateSyncProgress(syncJobId, {
+      jobId: syncJobId,
+      total: totalProducts,
+      completed: 0,
+      failed: 0,
+      percent: 0,
+      status: 'in_progress',
+      currentStep: `Starting sync of ${totalProducts} product(s)...`,
+      eta: null,
+      errors: []
+    });
+    
+    console.log(`🚀 Starting sync job ${syncJobId}: ${totalProducts} products to sync`);
+    console.log(`📋 [SyncService] Progress updated - total: ${totalProducts}`);
 
-    for (const ebayProduct of productsToSync) {
+    for (let i = 0; i < productsToSync.length; i++) {
+      const ebayProduct = productsToSync[i];
+      const productIndex = i + 1;
+      
+      // Check if we're paused due to rate limit
+      const rateLimitInfo = this.rateLimitStatus.get(syncJobId);
+      if (rateLimitInfo && rateLimitInfo.paused) {
+        const elapsed = Math.floor((Date.now() - rateLimitInfo.pausedAt) / 1000);
+        let remaining = Math.max(0, rateLimitInfo.retryAfter - elapsed);
+        
+        if (remaining > 0) {
+          // Still waiting for rate limit - update progress and wait
+          while (remaining > 0) {
+            this.updateSyncProgress(syncJobId, {
+              jobId: syncJobId,
+              total: totalProducts,
+              completed: syncedCount,
+              failed: failedCount,
+              percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
+              status: 'rate_limited',
+              currentStep: `Rate limit hit - waiting ${remaining}s for API limit refresh...`,
+              eta: null,
+              rateLimitRetryAfter: remaining,
+              errors: errors.slice(-10)
+            });
+            
+            // Wait 1 second and check again
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            const newElapsed = Math.floor((Date.now() - rateLimitInfo.pausedAt) / 1000);
+            remaining = Math.max(0, rateLimitInfo.retryAfter - newElapsed);
+          }
+          
+          // Rate limit period has passed, clear status
+          this.clearRateLimitStatus(syncJobId);
+        } else {
+          // Rate limit period has passed, clear status
+          this.clearRateLimitStatus(syncJobId);
+        }
+      }
+      
+      // Update progress: starting this product
+      this.updateSyncProgress(syncJobId, {
+        jobId: syncJobId,
+        total: totalProducts,
+        completed: syncedCount,
+        failed: failedCount,
+        percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
+        status: 'in_progress',
+        currentStep: `Syncing product ${productIndex}/${totalProducts}: ${ebayProduct.title || ebayProduct.ebay_item_id}`,
+        eta: this.calculateETA(syncedCount + failedCount, totalProducts, completedTimes, startTime),
+        errors: errors.slice(-10) // Keep last 10 errors
+      });
       try {
         // Log product data from database before transformation
         console.log(`=== SYNC: Product ${ebayProduct.ebay_item_id} from database (AFTER mergeCustomFields) ===`);
@@ -359,10 +577,18 @@ class SyncService {
         }
         
         // Sync to ShareTribe (use existing sharetribe_listing_id if product was already synced)
+        const syncStartTime = Date.now();
         const result = await sharetribeService.createOrUpdateListing(
           transformedProduct,
           ebayProduct.sharetribe_listing_id || null
         );
+        const syncEndTime = Date.now();
+        completedTimes.push(syncEndTime - syncStartTime);
+        
+        // Keep only last 10 completion times for rolling average
+        if (completedTimes.length > 10) {
+          completedTimes.shift();
+        }
 
         // Update or insert product in database
         await this.upsertProduct(tenantId, {
@@ -374,21 +600,162 @@ class SyncService {
         });
 
         syncedCount++;
+        
+        // Update progress: product synced successfully
+        this.updateSyncProgress(syncJobId, {
+          jobId: syncJobId,
+          total: totalProducts,
+          completed: syncedCount,
+          failed: failedCount,
+          percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
+          status: 'in_progress',
+          currentStep: `Synced ${syncedCount}/${totalProducts} products`,
+          eta: this.calculateETA(syncedCount + failedCount, totalProducts, completedTimes, startTime),
+          errors: errors.slice(-10)
+        });
       } catch (error) {
         failedCount++;
-        errors.push({
+        const errorInfo = {
           itemId: ebayProduct.ebay_item_id,
+          title: ebayProduct.title || 'Unknown',
           error: error.message
+        };
+        errors.push(errorInfo);
+        
+        // Update progress: product failed
+        this.updateSyncProgress(syncJobId, {
+          jobId: syncJobId,
+          total: totalProducts,
+          completed: syncedCount,
+          failed: failedCount,
+          percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
+          status: 'in_progress',
+          currentStep: `Failed: ${ebayProduct.title || ebayProduct.ebay_item_id}`,
+          eta: this.calculateETA(syncedCount + failedCount, totalProducts, completedTimes, startTime),
+          errors: errors.slice(-10)
         });
+        
         console.error(`Error syncing product ${ebayProduct.ebay_item_id}:`, error);
       }
     }
 
+    // Final progress update
+    this.updateSyncProgress(syncJobId, {
+      jobId: syncJobId,
+      total: totalProducts,
+      completed: syncedCount,
+      failed: failedCount,
+      percent: 100,
+      status: 'completed',
+      currentStep: 'Sync completed',
+      eta: 0,
+      errors: errors
+    });
+    
+    // Unregister sync job and rate limit callback
+    rateLimiter.unregisterSyncJob(syncJobId);
+    rateLimiter.unregisterRateLimitCallback(syncJobId);
+    this.clearRateLimitStatus(syncJobId);
+    
+    // Clear progress after 5 minutes (keep it for a bit in case UI needs to refresh)
+    setTimeout(() => {
+      this.clearSyncProgress(syncJobId);
+    }, 5 * 60 * 1000);
+
     return {
+      success: true,
       synced: syncedCount,
       failed: failedCount,
-      errors: errors
+      errors: errors,
+      jobId: syncJobId
     };
+    } catch (error) {
+      console.error('❌ Error syncing products:', error);
+      console.error('Error stack:', error.stack);
+      
+      // Update progress: sync failed
+      const currentProgress = this.getSyncProgress(syncJobId);
+      const totalProducts = currentProgress?.total || 0;
+      this.updateSyncProgress(syncJobId, {
+        jobId: syncJobId,
+        total: totalProducts,
+        completed: currentProgress?.completed || 0,
+        failed: currentProgress?.failed || 0,
+        percent: currentProgress?.percent || 0,
+        status: 'error',
+        currentStep: `Error: ${error.message}`,
+        eta: null,
+        errors: currentProgress?.errors || [{ itemId: 'SYNC_ERROR', error: error.message }]
+      });
+      
+      // Unregister sync job and rate limit callback
+      rateLimiter.unregisterSyncJob(syncJobId);
+      rateLimiter.unregisterRateLimitCallback(syncJobId);
+      this.clearRateLimitStatus(syncJobId);
+      
+      throw error;
+    }
+  }
+  
+  /**
+   * Handle rate limit event
+   */
+  handleRateLimit(jobId, retryAfter) {
+    const progress = this.getSyncProgress(jobId);
+    if (progress) {
+      this.rateLimitStatus.set(jobId, {
+        retryAfter: retryAfter,
+        paused: true,
+        pausedAt: Date.now()
+      });
+      
+      // Update progress to show rate limit status
+      this.updateSyncProgress(jobId, {
+        ...progress,
+        status: 'rate_limited',
+        currentStep: `Rate limit hit - waiting ${retryAfter}s for API limit refresh...`,
+        rateLimitRetryAfter: retryAfter
+      });
+    }
+  }
+  
+  /**
+   * Clear rate limit status
+   */
+  clearRateLimitStatus(jobId) {
+    this.rateLimitStatus.delete(jobId);
+    const progress = this.getSyncProgress(jobId);
+    if (progress && progress.status === 'rate_limited') {
+      this.updateSyncProgress(jobId, {
+        ...progress,
+        status: 'in_progress',
+        currentStep: 'Resuming sync...',
+        rateLimitRetryAfter: null
+      });
+    }
+  }
+  
+  /**
+   * Calculate ETA based on rolling average of completion times
+   */
+  calculateETA(completed, total, completedTimes, startTime) {
+    if (completed === 0 || completedTimes.length === 0) {
+      return null; // Not enough data yet
+    }
+    
+    // Calculate average time per product from recent completions
+    const avgTimePerProduct = completedTimes.reduce((sum, time) => sum + time, 0) / completedTimes.length;
+    
+    // Calculate effective rate (products per second)
+    const effectiveRatePerSecond = 1000 / avgTimePerProduct; // Convert ms to seconds
+    
+    // Remaining products
+    const remaining = total - completed;
+    
+    // ETA in seconds
+    const etaSeconds = remaining / effectiveRatePerSecond;
+    
+    return Math.max(0, Math.round(etaSeconds));
   }
 
   async applyFieldMappings(product, mappings) {

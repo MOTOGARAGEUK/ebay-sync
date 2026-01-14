@@ -1657,43 +1657,259 @@ router.post('/sync/preview', async (req, res) => {
 });
 
 router.post('/sync', async (req, res) => {
+  let jobId = null;
   try {
+    console.log(`📋 [API] /sync endpoint called - START`);
     const tenantId = getTenantId(req);
     const { item_ids, sharetribe_user_id } = req.body; // Optional array of item IDs to sync, optional sharetribe_user_id
     
-    const dbInstance = db.getDb();
-    const logId = await new Promise((resolve, reject) => {
-      dbInstance.run(
-        `INSERT INTO sync_logs (tenant_id, user_id, sync_type, status) VALUES (?, ?, ?, ?)`,
-        [tenantId, sharetribe_user_id || null, 'manual', 'running'],
-        function(err) {
-          if (err) reject(err);
-          else resolve(this.lastID);
-        }
-      );
-    });
-
-    const result = await syncService.syncProducts(tenantId, item_ids, sharetribe_user_id);
+    console.log(`📋 [API] Request body:`, { item_ids, sharetribe_user_id });
     
-    // Update log
-    dbInstance.run(
-      `UPDATE sync_logs SET status = ?, products_synced = ?, products_failed = ?, completed_at = CURRENT_TIMESTAMP
-       WHERE id = ?`,
-      [result.failed === 0 ? 'success' : 'partial', result.synced, result.failed, logId]
-    );
+    // Check if a sync job is already running
+    const activeJobId = syncService.getActiveSyncJobId();
+    if (activeJobId) {
+      console.log(`📋 [API] Sync job already in progress: ${activeJobId}`);
+      const activeProgress = syncService.getSyncProgress(activeJobId);
+      
+      // Return the existing job ID (not an error)
+      const responseData = {
+        success: true,
+        jobId: activeJobId,
+        alreadyRunning: true,
+        message: 'A sync job is already in progress. Attaching to existing job.',
+        progress: activeProgress ? {
+          total: activeProgress.total,
+          completed: activeProgress.completed,
+          failed: activeProgress.failed,
+          percent: activeProgress.percent,
+          status: activeProgress.status,
+          currentStep: activeProgress.currentStep
+        } : null
+      };
+      console.log(`📋 [API] Returning existing job: ${activeJobId}`);
+      return res.json(responseData);
+    }
+    
+    // Generate job ID for progress tracking
+    jobId = `sync_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    console.log(`📋 [API] Created sync job: ${jobId}`);
+    
+    // Initialize progress IMMEDIATELY so the frontend can start polling
+    // We'll update it with actual product count once sync starts
+    try {
+      syncService.updateSyncProgress(jobId, {
+        jobId: jobId,
+        total: 0, // Will be updated when sync starts
+        completed: 0,
+        failed: 0,
+        percent: 0,
+        status: 'starting',
+        currentStep: 'Initializing sync...',
+        eta: null,
+        errors: []
+      });
+      console.log(`📋 [API] Progress initialized for job ${jobId}`);
+    } catch (progressError) {
+      console.error(`❌ [API] Error initializing progress:`, progressError);
+      // Continue anyway - we'll still send the response
+    }
+    
+    // Return immediately with job ID for progress tracking
+    // Don't wait for database operations - send response first
+    const responseData = { 
+      success: true, 
+      jobId: jobId,
+      message: 'Sync started. Use /api/sync/progress/:jobId to track progress.'
+    };
+    console.log(`📋 [API] Sending response for job ${jobId}:`, responseData);
+    res.json(responseData);
+    console.log(`✅ [API] Response sent for job ${jobId}`);
+    
+    // Now do database operations and start sync asynchronously (after response is sent)
+    try {
+      const dbInstance = db.getDb();
+      const logId = await new Promise((resolve, reject) => {
+        dbInstance.run(
+          `INSERT INTO sync_logs (tenant_id, user_id, sync_type, status) VALUES (?, ?, ?, ?)`,
+          [tenantId, sharetribe_user_id || null, 'manual', 'running'],
+          function(err) {
+            if (err) {
+              console.error(`❌ [API] Error inserting sync log for job ${jobId}:`, err);
+              reject(err);
+            } else {
+              console.log(`📋 [API] Sync log created with ID ${this.lastID} for job ${jobId}`);
+              resolve(this.lastID);
+            }
+          }
+        );
+      });
 
-    res.json({ success: true, ...result });
+      // Start sync asynchronously (don't wait for completion)
+      syncService.syncProducts(tenantId, item_ids, sharetribe_user_id, jobId)
+        .then(result => {
+          console.log(`✅ [API] Sync completed for job ${jobId}:`, result);
+          // Update log on completion
+          dbInstance.run(
+            `UPDATE sync_logs SET status = ?, products_synced = ?, products_failed = ?, completed_at = CURRENT_TIMESTAMP
+             WHERE id = ?`,
+            [result.failed === 0 ? 'success' : 'partial', result.synced, result.failed, logId]
+          );
+        })
+        .catch(error => {
+          console.error(`❌ [API] Sync failed for job ${jobId}:`, error);
+          
+          // Check if this is an "already running" error - if so, don't update progress as error
+          const isAlreadyRunningError = error.message && error.message.includes('already in progress');
+          if (isAlreadyRunningError) {
+            console.log(`📋 [API] Ignoring "already running" error for job ${jobId} - this should not happen`);
+            // Don't update progress - the existing job's progress should be used instead
+            return;
+          }
+          
+          // Update progress with error (only for real errors)
+          syncService.updateSyncProgress(jobId, {
+            jobId: jobId,
+            total: syncService.getSyncProgress(jobId)?.total || 0,
+            completed: syncService.getSyncProgress(jobId)?.completed || 0,
+            failed: syncService.getSyncProgress(jobId)?.failed || 0,
+            percent: syncService.getSyncProgress(jobId)?.percent || 0,
+            status: 'error',
+            currentStep: `Error: ${error.message}`,
+            eta: null,
+            errors: [{ itemId: 'SYNC_ERROR', error: error.message }]
+          });
+          // Log error
+          dbInstance.run(
+            `UPDATE sync_logs SET status = ?, products_failed = ?, error_message = ?, completed_at = CURRENT_TIMESTAMP
+             WHERE id = ?`,
+            ['failed', 0, error.message, logId]
+          );
+        });
+    } catch (dbError) {
+      console.error(`❌ [API] Error setting up sync log for job ${jobId}:`, dbError);
+      // Don't fail the request - sync can still proceed without the log entry
+    }
   } catch (error) {
-    const tenantId = getTenantId(req);
-    const dbInstance = db.getDb();
+    console.error(`❌ [API] Error in /sync endpoint:`, error);
+    console.error(`❌ [API] Error stack:`, error.stack);
     
-    // Log error
-    dbInstance.run(
-      `INSERT INTO sync_logs (tenant_id, sync_type, status, products_failed, error_message)
-       VALUES (?, ?, ?, ?, ?)`,
-      [tenantId, 'manual', 'failed', 0, error.message]
-    );
+    // Try to send error response, but don't fail if response already sent
+    if (!res.headersSent) {
+      // If we have a jobId, return it anyway so frontend can track progress
+      if (jobId) {
+        console.log(`📋 [API] Sending error response with jobId ${jobId}`);
+        res.status(500).json({ 
+          success: false,
+          error: error.message,
+          jobId: jobId,
+          message: 'Sync started but encountered an error. Use /api/sync/progress/:jobId to track progress.'
+        });
+      } else {
+        console.log(`📋 [API] Sending error response without jobId`);
+        res.status(500).json({ error: error.message });
+      }
+    } else {
+      console.log(`⚠️ [API] Response already sent, cannot send error response`);
+    }
     
+    // Try to log error to database (don't block)
+    try {
+      const tenantId = getTenantId(req);
+      const dbInstance = db.getDb();
+      dbInstance.run(
+        `INSERT INTO sync_logs (tenant_id, sync_type, status, products_failed, error_message)
+         VALUES (?, ?, ?, ?, ?)`,
+        [tenantId, 'manual', 'failed', 0, error.message]
+      );
+    } catch (dbError) {
+      console.error(`❌ [API] Error logging to database:`, dbError);
+    }
+  }
+});
+
+// Get active sync job (if any)
+router.get('/sync/active', (req, res) => {
+  try {
+    const { sharetribe_user_id } = req.query;
+    console.log(`📋 [API] Checking for active sync job, user: ${sharetribe_user_id}`);
+    
+    const activeProgress = syncService.getActiveSyncJobProgress();
+    
+    if (!activeProgress) {
+      console.log(`📋 [API] No active sync job found`);
+      return res.json({ active: false, jobId: null });
+    }
+    
+    // If user_id is specified, verify the job belongs to that user
+    // Note: We can't easily verify this without storing user_id with the job
+    // For now, return the active job if it exists
+    console.log(`📋 [API] Active sync job found: ${activeProgress.jobId}`);
+    res.json({
+      active: true,
+      jobId: activeProgress.jobId,
+      status: activeProgress.status,
+      total: activeProgress.total,
+      completed: activeProgress.completed,
+      failed: activeProgress.failed,
+      percent: activeProgress.percent,
+      currentStep: activeProgress.currentStep,
+      startedAt: activeProgress.lastUpdate || Date.now()
+    });
+  } catch (error) {
+    console.error(`❌ [API] Error checking active sync job:`, error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get sync progress
+router.get('/sync/progress/:jobId', (req, res) => {
+  try {
+    const { jobId } = req.params;
+    console.log(`📋 [API] Progress request for job: ${jobId}`);
+    const progress = syncService.getSyncProgress(jobId);
+    
+    if (!progress) {
+      console.log(`📋 [API] Progress not found for job: ${jobId}`);
+      return res.status(404).json({ error: 'Sync job not found or completed' });
+    }
+    
+    console.log(`📋 [API] Progress found for job ${jobId}:`, {
+      total: progress.total,
+      completed: progress.completed,
+      failed: progress.failed,
+      percent: progress.percent,
+      status: progress.status,
+      currentStep: progress.currentStep
+    });
+    
+    // Format ETA as MM:SS
+    let etaFormatted = null;
+    if (progress.eta !== null && progress.eta > 0) {
+      const minutes = Math.floor(progress.eta / 60);
+      const seconds = progress.eta % 60;
+      etaFormatted = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+    }
+    
+    // Include rate limit info if present
+    const rateLimitInfo = syncService.rateLimitStatus?.get(jobId);
+    const response = {
+      ...progress,
+      etaFormatted: etaFormatted
+    };
+    
+    if (rateLimitInfo && rateLimitInfo.paused) {
+      const elapsed = Math.floor((Date.now() - rateLimitInfo.pausedAt) / 1000);
+      const remaining = Math.max(0, rateLimitInfo.retryAfter - elapsed);
+      response.rateLimitRetryAfter = remaining;
+      if (progress.status !== 'rate_limited') {
+        response.status = 'rate_limited';
+      }
+    }
+    
+    res.json(response);
+  } catch (error) {
+    console.error(`📋 [API] Error getting progress:`, error);
     res.status(500).json({ error: error.message });
   }
 });

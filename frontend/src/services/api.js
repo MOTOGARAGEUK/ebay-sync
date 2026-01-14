@@ -7,6 +7,7 @@ const api = axios.create({
   headers: {
     'Content-Type': 'application/json',
   },
+  timeout: 30000, // 30 second timeout
 });
 
 // API Configuration
@@ -86,6 +87,16 @@ export const uploadUserImage = (id, imageFile) => {
 // Sync
 export const syncProducts = (itemIds = null, sharetribeUserId = null) => 
   api.post('/sync', { item_ids: itemIds, sharetribe_user_id: sharetribeUserId });
+
+// Get sync progress
+export const getSyncProgress = (jobId) => 
+  api.get(`/sync/progress/${jobId}`);
+
+// Get active sync job
+export const getActiveSyncJob = (sharetribeUserId = null) => {
+  const params = sharetribeUserId ? { sharetribe_user_id: sharetribeUserId } : {};
+  return api.get('/sync/active', { params });
+};
 
 // Preview ShareTribe payload (without syncing)
 export const previewPayload = (itemIds = null, sharetribeUserId = null) => 

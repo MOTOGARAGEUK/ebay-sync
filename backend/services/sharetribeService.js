@@ -1,5 +1,6 @@
 const axios = require('axios');
 const responseStore = require('../utils/responseStore');
+const rateLimiter = require('../utils/sharetribeRateLimiter');
 
 class ShareTribeService {
   constructor(config) {
@@ -381,18 +382,23 @@ class ShareTribeService {
         console.log('Has images field:', 'images' in listingData);
         console.log('Images field value:', listingData.images);
         
-        const response = await axios.put(
-          apiUrl,
-          listingData, // Send the exact object
-          {
-            headers: headers,
-            params: {
-              include: 'images' // Request expanded images in response to verify attachment (ShareTribe expects comma-separated string)
-            },
-            validateStatus: function (status) {
-              return status < 500; // Don't throw on 4xx errors, we'll handle them
+        // Use rate limiter for PUT request (update listing)
+        const response = await rateLimiter.executeRequest(
+          () => axios.put(
+            apiUrl,
+            listingData, // Send the exact object
+            {
+              headers: headers,
+              params: {
+                include: 'images' // Request expanded images in response to verify attachment (ShareTribe expects comma-separated string)
+              },
+              validateStatus: function (status) {
+                return status < 500; // Don't throw on 4xx errors, we'll handle them
+              }
             }
-          }
+          ),
+          'post', // Update is a POST-type operation
+          `update_${existingListingId}`
         );
         
         console.log('=== ShareTribe API Update Response ===');
@@ -521,18 +527,23 @@ class ShareTribeService {
         
         // Send the EXACT payload object - no modifications
         // Include images in response to verify they were attached
-        const response = await axios.post(
-          apiUrl,
-          listingData, // Send the exact object, not a copy
-          {
-            headers: headers,
-            params: {
-              include: 'images' // Request expanded images in response to verify attachment (ShareTribe expects comma-separated string)
-            },
-            validateStatus: function (status) {
-              return status < 500; // Don't throw on 4xx errors, we'll handle them
+        // Use rate limiter for POST request (create listing)
+        const response = await rateLimiter.executeRequest(
+          () => axios.post(
+            apiUrl,
+            listingData, // Send the exact object, not a copy
+            {
+              headers: headers,
+              params: {
+                include: 'images' // Request expanded images in response to verify attachment (ShareTribe expects comma-separated string)
+              },
+              validateStatus: function (status) {
+                return status < 500; // Don't throw on 4xx errors, we'll handle them
+              }
             }
-          }
+          ),
+          'create', // Creating listing uses 'create' endpoint type
+          `create_${productData.ebay_item_id || 'unknown'}`
         );
         
         console.log('=== ShareTribe API Create Response ===');
@@ -1471,11 +1482,16 @@ class ShareTribeService {
         apiUrl = `${this.baseUrl}/own_listings/${listingId}.json`;
       }
       
-      const response = await axios.get(
-        apiUrl,
-        {
-          headers: headers
-        }
+      // Use rate limiter for GET request
+      const response = await rateLimiter.executeRequest(
+        () => axios.get(
+          apiUrl,
+          {
+            headers: headers
+          }
+        ),
+        'get',
+        `get_listing_${listingId}`
       );
       return response.data;
     } catch (error) {
@@ -1495,11 +1511,16 @@ class ShareTribeService {
         apiUrl = `${this.baseUrl}/own_listings/${listingId}.json`;
       }
       
-      await axios.delete(
-        apiUrl,
-        {
-          headers: headers
-        }
+      // Use rate limiter for DELETE request (POST-type operation)
+      await rateLimiter.executeRequest(
+        () => axios.delete(
+          apiUrl,
+          {
+            headers: headers
+          }
+        ),
+        'post',
+        `delete_listing_${listingId}`
       );
       return { success: true };
     } catch (error) {
@@ -1527,17 +1548,22 @@ class ShareTribeService {
       const headers = await this.getAuthHeaders();
       console.log('Authorization header:', headers.Authorization ? `${headers.Authorization.substring(0, 30)}...` : 'MISSING');
       
-      const response = await axios.get(
-        apiUrl,
-        {
-          headers: headers,
-          params: {
-            per_page: 100
-          },
-          validateStatus: function (status) {
-            return status < 500; // Don't throw on 4xx errors
+      // Use rate limiter for GET request
+      const response = await rateLimiter.executeRequest(
+        () => axios.get(
+          apiUrl,
+          {
+            headers: headers,
+            params: {
+              per_page: 100
+            },
+            validateStatus: function (status) {
+              return status < 500; // Don't throw on 4xx errors
+            }
           }
-        }
+        ),
+        'get',
+        'get_all_listings'
       );
       
       console.log('Response status:', response.status);
@@ -2439,14 +2465,19 @@ class ShareTribeService {
       
       console.log(`Uploading image to ShareTribe: ${imageName || 'unnamed'}`);
       
-      const response = await axios.post(apiUrl, formData, {
-        headers: {
-          ...headers,
-          ...formData.getHeaders()
-        },
-        maxContentLength: Infinity,
-        maxBodyLength: Infinity
-      });
+      // Use rate limiter for POST request (upload image)
+      const response = await rateLimiter.executeRequest(
+        () => axios.post(apiUrl, formData, {
+          headers: {
+            ...headers,
+            ...formData.getHeaders()
+          },
+          maxContentLength: Infinity,
+          maxBodyLength: Infinity
+        }),
+        'post',
+        `upload_image_${imageName || 'unnamed'}`
+      );
 
       console.log(`Image upload response status: ${response.status}`);
       console.log(`Image upload response structure:`, JSON.stringify(response.data, null, 2));
@@ -2506,14 +2537,19 @@ class ShareTribeService {
       console.log('Using endpoint: GET', apiUrl);
       
       // Integration API uses GET request for /users/query
-      const response = await axios.get(
-        apiUrl,
-        {
-          headers: headers,
-          validateStatus: function (status) {
-            return status < 500;
+      // Use rate limiter for GET request
+      const response = await rateLimiter.executeRequest(
+        () => axios.get(
+          apiUrl,
+          {
+            headers: headers,
+            validateStatus: function (status) {
+              return status < 500;
+            }
           }
-        }
+        ),
+        'get',
+        'get_all_users'
       );
       
       console.log(`Response status: ${response.status}`);
