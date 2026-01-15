@@ -17,10 +17,16 @@ class SyncService {
     this.syncProgress = new Map();
     
     // Track rate limit status
-    this.rateLimitStatus = new Map(); // jobId -> { retryAfter: seconds, paused: boolean }
+    this.rateLimitStatus = new Map(); // jobId -> { retryAfter: seconds, paused: boolean, retryAt: timestamp, rateLimitCount: number }
     
     // Track resume timeouts for cleanup
     this.resumeTimeouts = new Map(); // jobId -> timeoutId
+    
+    // Track retry attempts per product (for exponential backoff)
+    this.productRetryAttempts = new Map(); // jobId -> Map(productId -> retryCount)
+    
+    // Max retry attempts before marking as failed
+    this.MAX_RETRY_ATTEMPTS = 10;
   }
   
   /**
@@ -30,12 +36,12 @@ class SyncService {
     const progress = this.syncProgress.get(jobId) || null;
     if (progress) {
       console.log(`📋 [SyncService] Getting progress for job ${jobId}:`, {
-        total: progress.total,
-        completed: progress.completed,
-        failed: progress.failed,
-        percent: progress.percent,
-        status: progress.status,
-        currentStep: progress.currentStep
+        total: progress.total || 0,
+        completed: progress.completed || 0,
+        failed: progress.failed || 0,
+        percent: progress.percent || 0,
+        status: progress.status || 'unknown',
+        currentStep: progress.currentStep || 'N/A'
       });
     } else {
       console.log(`📋 [SyncService] No progress found for job ${jobId}`);
@@ -51,6 +57,20 @@ class SyncService {
   updateSyncProgress(jobId, progress) {
     const existingProgress = this.syncProgress.get(jobId) || {};
     const now = Date.now();
+    
+    // Ensure existingProgress has all required properties with defaults
+    const safeExistingProgress = {
+      completed: existingProgress.completed || 0,
+      failed: existingProgress.failed || 0,
+      total: existingProgress.total || 0,
+      processed: existingProgress.processed || 0,
+      percent: existingProgress.percent || 0,
+      status: existingProgress.status || 'in_progress',
+      state: existingProgress.state || 'RUNNING',
+      updatedAt: existingProgress.updatedAt || now,
+      lastUpdatedAt: existingProgress.lastUpdatedAt || now,
+      ...existingProgress // Spread to preserve any other properties
+    };
     
     // State machine: RUNNING, PAUSED_RATE_LIMIT (only for actual 429), COMPLETED, FAILED
     let state = progress.state || 'RUNNING';
@@ -71,11 +91,31 @@ class SyncService {
       state = 'COMPLETED';
     } else if (progress.status === 'completed') {
       // Only COMPLETED if processed === total (100%)
-      const processed = (progress.completed || existingProgress.completed || 0) + (progress.failed || existingProgress.failed || 0);
-      const total = progress.total || existingProgress.total || 0;
+      const processed = (progress.completed !== undefined ? progress.completed : safeExistingProgress.completed) + 
+                        (progress.failed !== undefined ? progress.failed : safeExistingProgress.failed);
+      const total = progress.total !== undefined ? progress.total : safeExistingProgress.total;
       state = (processed === total) ? 'COMPLETED' : 'RUNNING'; // Keep RUNNING if not complete (don't set PAUSED)
     } else if (progress.status === 'error' || progress.status === 'failed' || state === 'FAILED') {
-      state = 'FAILED';
+      // CRITICAL: Never set FAILED if this is a 429 rate limit error
+      // Check if error is a rate limit (429) - if so, set to PAUSED_RATE_LIMIT instead
+      const isRateLimitError = progress.lastErrorCode === 429 || 
+                               progress.lastErrorMessage?.includes('rate limit') ||
+                               progress.lastErrorMessage?.includes('429') ||
+                               progress.lastErrorMessage?.includes('Too Many Requests');
+      
+      if (isRateLimitError) {
+        // 429 error - set to PAUSED_RATE_LIMIT, not FAILED
+        state = 'PAUSED_RATE_LIMIT';
+        // Ensure retryAt is set if not already
+        if (!progress.retryAt && !progress.nextRetryAt) {
+          const now = Date.now();
+          progress.retryAt = now + (this.minPauseSeconds || 15) * 1000;
+          progress.nextRetryAt = progress.retryAt;
+        }
+      } else {
+        // Non-rate-limit error - set to FAILED
+        state = 'FAILED';
+      }
     } else if (progress.retryAt || progress.nextRetryAt) {
       // Only set PAUSED_RATE_LIMIT if we have retryAt AND it's from a real 429
       // Otherwise, keep RUNNING (proactive pacing)
@@ -104,34 +144,34 @@ class SyncService {
     // This helps frontend detect if sync is still active
     const finalState = progress.state || state;
     const shouldRefreshUpdatedAt = finalState === 'RUNNING' && 
-                                   existingProgress.updatedAt && 
-                                   (now - existingProgress.updatedAt) > 3000; // Refresh every 3s
+                                   safeExistingProgress.updatedAt && 
+                                   (now - safeExistingProgress.updatedAt) > 3000; // Refresh every 3s
     
     const progressData = {
-      ...existingProgress,
+      ...safeExistingProgress,
       ...progress,
       state: finalState,
       lastUpdatedAt: now,
-      updatedAt: shouldRefreshUpdatedAt ? now : (progress.updatedAt || existingProgress.updatedAt || now), // Refresh every 3s while RUNNING
+      updatedAt: shouldRefreshUpdatedAt ? now : (progress.updatedAt !== undefined ? progress.updatedAt : safeExistingProgress.updatedAt), // Refresh every 3s while RUNNING
       // Calculate processed and remaining
       processed: progress.processed !== undefined ? progress.processed : 
-                 ((progress.completed !== undefined ? progress.completed : existingProgress.completed || 0) + 
-                  (progress.failed !== undefined ? progress.failed : existingProgress.failed || 0)),
+                 ((progress.completed !== undefined ? progress.completed : safeExistingProgress.completed) + 
+                  (progress.failed !== undefined ? progress.failed : safeExistingProgress.failed)),
       // Lock total - never allow it to change after job starts
-      total: existingProgress.total || progress.total || 0, // Preserve locked total
+      total: safeExistingProgress.total || progress.total || 0, // Preserve locked total
       // Calculate remaining
       remaining: progress.remaining !== undefined ? progress.remaining : 
-                 Math.max(0, (existingProgress.total || progress.total || 0) - 
-                 ((progress.completed !== undefined ? progress.completed : existingProgress.completed || 0) + 
-                  (progress.failed !== undefined ? progress.failed : existingProgress.failed || 0))),
+                 Math.max(0, (safeExistingProgress.total || progress.total || 0) - 
+                 ((progress.completed !== undefined ? progress.completed : safeExistingProgress.completed) + 
+                  (progress.failed !== undefined ? progress.failed : safeExistingProgress.failed))),
       // Preserve retry fields if not being updated
-      lastAttemptAt: progress.lastAttemptAt || existingProgress.lastAttemptAt || null,
-      nextRetryAt: progress.nextRetryAt !== undefined ? progress.nextRetryAt : existingProgress.nextRetryAt,
-      retryAt: retryAt !== null ? retryAt : (progress.retryAt !== undefined ? progress.retryAt : existingProgress.retryAt), // Explicit retryAt timestamp
-      retryInMs: retryInMs !== null ? retryInMs : (progress.retryInMs !== undefined ? progress.retryInMs : existingProgress.retryInMs), // Milliseconds until retry
-      retryAttemptCount: progress.retryAttemptCount !== undefined ? progress.retryAttemptCount : (existingProgress.retryAttemptCount || 0),
-      lastErrorCode: progress.lastErrorCode || existingProgress.lastErrorCode || null,
-      lastErrorMessage: progress.lastErrorMessage || existingProgress.lastErrorMessage || null,
+      lastAttemptAt: progress.lastAttemptAt !== undefined ? progress.lastAttemptAt : safeExistingProgress.lastAttemptAt,
+      nextRetryAt: progress.nextRetryAt !== undefined ? progress.nextRetryAt : safeExistingProgress.nextRetryAt,
+      retryAt: retryAt !== null ? retryAt : (progress.retryAt !== undefined ? progress.retryAt : safeExistingProgress.retryAt), // Explicit retryAt timestamp
+      retryInMs: retryInMs !== null ? retryInMs : (progress.retryInMs !== undefined ? progress.retryInMs : safeExistingProgress.retryInMs), // Milliseconds until retry
+      retryAttemptCount: progress.retryAttemptCount !== undefined ? progress.retryAttemptCount : (safeExistingProgress.retryAttemptCount || 0),
+      lastErrorCode: progress.lastErrorCode !== undefined ? progress.lastErrorCode : safeExistingProgress.lastErrorCode,
+      lastErrorMessage: progress.lastErrorMessage !== undefined ? progress.lastErrorMessage : safeExistingProgress.lastErrorMessage,
       lastUpdate: now // Keep for backward compatibility
     };
     
@@ -200,8 +240,8 @@ class SyncService {
       if (existingProgress) {
         return {
           success: true,
-          synced: existingProgress.completed,
-          failed: existingProgress.failed,
+          synced: existingProgress.completed || 0,
+          failed: existingProgress.failed || 0,
           errors: existingProgress.errors || [],
           jobId: existingJobId,
           alreadyRunning: true
@@ -215,666 +255,278 @@ class SyncService {
     rateLimiter.registerSyncJob(syncJobId);
     
     // Register rate limit callback
-    // Callback receives: (retryAt, errorCode, errorMessage)
+    // Callback receives: (retryAt, errorCode, errorMessage, retryAfterHeader)
     // retryAt is epoch milliseconds (timestamp) when retry should happen
-    rateLimiter.registerRateLimitCallback(syncJobId, (retryAt, errorCode = 429, errorMessage = 'Rate limit exceeded') => {
-      this.handleRateLimit(syncJobId, retryAt, errorCode, errorMessage);
+    rateLimiter.registerRateLimitCallback(syncJobId, async (retryAt, errorCode = 429, errorMessage = 'Rate limit exceeded', retryAfterHeader = null) => {
+      await this.handleRateLimit(syncJobId, retryAt, errorCode, errorMessage, retryAfterHeader);
     });
     
     try {
-    const dbInstance = db.getDb();
-    
-    // Get API configuration (shared credentials)
-    const config = await this.getApiConfig(tenantId);
-    if (!config.sharetribe) {
-      throw new Error('API configuration incomplete. Please configure ShareTribe credentials.');
-    }
-
-    // Get ShareTribe user ID and configuration if provided
-    let sharetribeUserIdValue = null;
-    let userLocation = null;
-    let userConfig = null;
-    if (sharetribeUserId) {
-      const userRow = await new Promise((resolve, reject) => {
-        dbInstance.get(
-          `SELECT sharetribe_user_id, location, parcel,
-                  pickup_enabled, shipping_enabled, shipping_measurement,
-                  transaction_process_alias, unit_type, default_image_id, default_image_path
-           FROM sharetribe_users WHERE id = ?`,
-          [sharetribeUserId],
-          (err, row) => {
-            if (err) {
-              reject(err);
-            } else {
-              resolve(row);
-            }
-          }
-        );
-      });
+      const dbInstance = db.getDb();
       
-      if (!userRow) {
-        throw new Error('ShareTribe user not found');
+        // Get API configuration (shared credentials)
+        const config = await this.getApiConfig(tenantId);
+      if (!config.sharetribe) {
+        throw new Error('API configuration incomplete. Please configure ShareTribe credentials.');
       }
-      
-      sharetribeUserIdValue = userRow.sharetribe_user_id;
-      // Parse location JSON if it exists
-      if (userRow.location) {
-        try {
-          userLocation = JSON.parse(userRow.location);
-        } catch (e) {
-          console.warn('Failed to parse user location JSON:', e.message);
-        }
-      }
-      
-      // Parse parcel JSON if it exists
-      let userParcel = null;
-      if (userRow.parcel) {
-        try {
-          userParcel = JSON.parse(userRow.parcel);
-        } catch (e) {
-          console.warn('Failed to parse user parcel JSON:', e.message);
-        }
-      }
-      
-      // Store user configuration for listing defaults
-      userConfig = {
-        pickupEnabled: userRow.pickup_enabled !== undefined ? Boolean(userRow.pickup_enabled) : true,
-        shippingEnabled: userRow.shipping_enabled !== undefined ? Boolean(userRow.shipping_enabled) : true,
-        shippingMeasurement: userRow.shipping_measurement || 'custom',
-        parcel: userParcel,
-        transactionProcessAlias: userRow.transaction_process_alias || 'default-purchase/release-1',
-        unitType: userRow.unit_type || 'item',
-        defaultImageId: userRow.default_image_id || null,
-        defaultImagePath: userRow.default_image_path || null
-      };
-    } else if (config.sharetribe.userId) {
-      // Fallback to config user ID for backward compatibility
-      sharetribeUserIdValue = config.sharetribe.userId;
-    }
 
-    // Use shared API credentials with selected user ID
-    const sharetribeConfig = {
-      apiKey: config.sharetribe.apiKey,
-      apiSecret: config.sharetribe.apiSecret,
-      marketplaceId: config.sharetribe.marketplaceId,
-      userId: sharetribeUserIdValue
-    };
-
-    // Get field mappings
-    const fieldMappings = await this.getFieldMappings(tenantId);
-
-    // Initialize ShareTribe service
-    const sharetribeService = new ShareTribeService(sharetribeConfig);
-    
-    // Set sync context for event logging
-    sharetribeService.setSyncContext(syncJobId, tenantId, sharetribeUserId, null);
-
-    // Get products from database (not from eBay API)
-    let productsToSync = [];
-    
-    // Helper function to merge custom_fields back into product object
-    // This MUST match the logic in /sync/preview endpoint
-    const mergeCustomFields = (product) => {
-      // Start with the original product object (spread to ensure all properties are enumerable)
-      const completeProduct = { ...product };
-      
-      // Ensure all standard fields are explicitly set (even if null/undefined)
-      completeProduct.title = product.title || null;
-      completeProduct.description = product.description || null;
-      completeProduct.price = product.price !== undefined && product.price !== null ? product.price : null;
-      completeProduct.currency = product.currency || null;
-      completeProduct.quantity = product.quantity !== undefined && product.quantity !== null ? product.quantity : null;
-      completeProduct.images = product.images || null;
-      completeProduct.category = product.category || null;
-      completeProduct.condition = product.condition || null;
-      completeProduct.brand = product.brand || null;
-      completeProduct.sku = product.sku || null;
-      
-      console.log(`Sync: Product ${completeProduct.ebay_item_id} from database (before custom_fields merge):`, {
-        title: completeProduct.title,
-        description: completeProduct.description,
-        price: completeProduct.price,
-        currency: completeProduct.currency,
-        hasCustomFields: !!product.custom_fields,
-        allKeys: Object.keys(completeProduct)
-      });
-      
-      if (product.custom_fields) {
-        try {
-          const customFields = JSON.parse(product.custom_fields);
-          console.log(`Sync: Custom fields for product ${completeProduct.ebay_item_id}:`, customFields);
-          
-          // Merge ALL custom fields into the product
-          for (const key in customFields) {
-            completeProduct[key] = customFields[key];
-          }
-          
-          console.log(`Sync: After merging custom_fields, product ${completeProduct.ebay_item_id} has:`, {
-            categoryLevel1: completeProduct.categoryLevel1,
-            categoryLevel2: completeProduct.categoryLevel2,
-            allKeys: Object.keys(completeProduct),
-            allValues: Object.entries(completeProduct).filter(([k, v]) => v !== null && v !== undefined).map(([k, v]) => `${k}: ${v}`).join(', ')
-          });
-        } catch (e) {
-          console.error(`Error parsing custom_fields for product ${completeProduct.ebay_item_id}:`, e);
-        }
-      }
-      
-      // Remove custom_fields from the product object as it's now merged
-      delete completeProduct.custom_fields;
-      return completeProduct;
-    };
-    
-    // CRITICAL: Filter products by user_id to prevent cross-user sync
-    // Only sync products that belong to the specified ShareTribe user
-    const userFilter = sharetribeUserId 
-      ? ' AND user_id = ?'
-      : ' AND user_id IS NULL';
-    
-    const userFilterParams = sharetribeUserId ? [sharetribeUserId] : [];
-    
-    if (itemIds && itemIds.length > 0) {
-      // Sync specific items from database (scoped to user)
-      const placeholders = itemIds.map(() => '?').join(',');
-      productsToSync = await new Promise((resolve, reject) => {
-        dbInstance.all(
-          `SELECT * FROM products WHERE tenant_id = ?${userFilter} AND ebay_item_id IN (${placeholders})`,
-          [tenantId, ...userFilterParams, ...itemIds],
-          (err, rows) => {
-            if (err) {
-              reject(err);
-            } else {
-              // Merge custom_fields back into products
-              const mergedRows = (rows || []).map(mergeCustomFields);
-              // Log first product to debug
-              if (mergedRows && mergedRows.length > 0) {
-                console.log('Sample product from database:', {
-                  ebay_item_id: mergedRows[0].ebay_item_id,
-                  title: mergedRows[0].title,
-                  price: mergedRows[0].price,
-                  allFields: Object.keys(mergedRows[0]),
-                  categoryLevel1: mergedRows[0].categoryLevel1,
-                  categoryLevel2: mergedRows[0].categoryLevel2,
-                  listingType: mergedRows[0].listingType
-                });
+      // Get ShareTribe user ID and configuration if provided
+      let sharetribeUserIdValue = null;
+      let userLocation = null;
+      let userConfig = null;
+      if (sharetribeUserId) {
+        const userRow = await new Promise((resolve, reject) => {
+          dbInstance.get(
+            `SELECT sharetribe_user_id, location, parcel,
+                    pickup_enabled, shipping_enabled, shipping_measurement,
+                    transaction_process_alias, unit_type, default_image_id, default_image_path
+             FROM sharetribe_users WHERE id = ?`,
+            [sharetribeUserId],
+            (err, row) => {
+              if (err) {
+                reject(err);
+              } else {
+                resolve(row);
               }
-              resolve(mergedRows);
             }
-          }
-        );
-      });
-    } else {
-      // Sync all products from database (scoped to user)
-      productsToSync = await new Promise((resolve, reject) => {
-        dbInstance.all(
-          `SELECT * FROM products WHERE tenant_id = ?${userFilter}`,
-          [tenantId, ...userFilterParams],
-          (err, rows) => {
-            if (err) {
-              reject(err);
-            } else {
-              // Merge custom_fields back into products
-              const mergedRows = (rows || []).map(mergeCustomFields);
-              // Log first product to debug
-              if (mergedRows && mergedRows.length > 0) {
-                console.log('Sample product from database:', {
-                  ebay_item_id: mergedRows[0].ebay_item_id,
-                  title: mergedRows[0].title,
-                  price: mergedRows[0].price,
-                  allFields: Object.keys(mergedRows[0]),
-                  categoryLevel1: mergedRows[0].categoryLevel1,
-                  categoryLevel2: mergedRows[0].categoryLevel2,
-                  listingType: mergedRows[0].listingType
-                });
-              }
-              resolve(mergedRows);
-            }
-          }
-        );
-      });
-    }
-
-    // Initialize progress tracking
-    const totalProducts = productsToSync.length;
-    console.log(`📋 [SyncService] Products fetched for job ${syncJobId}: ${totalProducts} products`);
-    console.log(`📋 [SyncService] productsToSync array length:`, productsToSync.length);
-    console.log(`📋 [SyncService] productsToSync sample:`, productsToSync.slice(0, 2));
-    
-    if (totalProducts === 0) {
-      // No products to sync - mark as COMPLETED_SUCCESS (nothing to do = success)
-      console.log(`⚠️ [SyncService] No products to sync for job ${syncJobId}`);
-      this.updateSyncProgress(syncJobId, {
-        jobId: syncJobId,
-        total: 0,
-        completed: 0,
-        failed: 0,
-        processed: 0,
-        remaining: 0,
-        percent: 100,
-        status: 'completed',
-        state: 'COMPLETED_SUCCESS',
-        currentStep: 'No products to sync',
-        eta: 0,
-        errors: []
-      });
-      rateLimiter.unregisterSyncJob(syncJobId);
-      rateLimiter.unregisterRateLimitCallback(syncJobId);
-      return {
-        success: true,
-        synced: 0,
-        failed: 0,
-        errors: [],
-        jobId: syncJobId
-      };
-    }
-    
-    let syncedCount = 0;
-    let failedCount = 0;
-    const errors = [];
-    const startTime = Date.now();
-    const completedTimes = []; // Track completion times for ETA calculation
-    
-    // Update progress with actual product count (progress was initialized in API route)
-    // Store sharetribeUserId in progress for resume continuation
-    console.log(`📋 [SyncService] Updating progress for job ${syncJobId} with ${totalProducts} products`);
-    
-    // Persist job record with totalProducts set
-    await syncEventLogger.updateJobProgress(syncJobId, {
-      state: 'RUNNING',
-      processed: 0,
-      total: totalProducts, // Set totalProducts now
-      completed: 0,
-      failed: 0,
-      currentProductId: null,
-      currentStep: `Starting sync of ${totalProducts} product(s)...`,
-      retryAt: null,
-      throttleSettings: {
-        minDelayMs: rateLimiter.minRequestInterval || 1000,
-        concurrency: rateLimiter.maxRequestsPerMinute || 100
-      },
-      workspaceId: tenantId,
-      userId: sharetribeUserId || null
-    });
-    
-    this.updateSyncProgress(syncJobId, {
-      jobId: syncJobId,
-      total: totalProducts,
-      completed: 0,
-      failed: 0,
-      percent: 0,
-      status: 'in_progress',
-      state: 'RUNNING',
-      sharetribeUserId: sharetribeUserId, // Store for resume continuation
-      currentStep: `Starting sync of ${totalProducts} product(s)...`,
-      eta: null,
-      errors: [],
-      workspaceId: tenantId,
-      userId: sharetribeUserId || null
-    });
-    
-    console.log(`🚀 Starting sync job ${syncJobId}: ${totalProducts} products to sync`);
-    console.log(`📋 [SyncService] Progress updated - total: ${totalProducts}`);
-
-    for (let i = 0; i < productsToSync.length; i++) {
-      const ebayProduct = productsToSync[i];
-      const productIndex = i + 1;
-      
-      // Check if we're paused due to rate limit - wait until resumeAt
-      const rateLimitInfo = this.rateLimitStatus.get(syncJobId);
-      if (rateLimitInfo && rateLimitInfo.paused && rateLimitInfo.retryAt) {
-        const now = Date.now();
-        const retryAt = rateLimitInfo.retryAt;
+          );
+        });
         
-        if (now < retryAt) {
-          // Still waiting - update progress and wait
-          const retryInMs = Math.max(0, retryAt - now);
-          const retryInSeconds = Math.ceil(retryInMs / 1000);
-          
-          this.updateSyncProgress(syncJobId, {
-            jobId: syncJobId,
-            total: totalProducts,
-            completed: syncedCount,
-            failed: failedCount,
-            processed: syncedCount + failedCount,
-            percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
-            state: 'PAUSED',
-            status: 'paused',
-            nextRetryAt: retryAt,
-            retryAt: retryAt,
-            retryInMs: retryInMs,
-            retryInSeconds: retryInSeconds,
-            currentStep: `Sharetribe API limit reached (100 requests/min). Sync will resume in ${formatTime(retryInSeconds)}.`,
-            eta: null,
-            errors: errors.slice(-10)
-          });
-          
-          // Wait until retry time
-          await new Promise(resolve => setTimeout(resolve, retryInMs));
+        if (!userRow) {
+          throw new Error('ShareTribe user not found');
         }
         
-        // After wait, clear pause flag to allow ONE request attempt
-        rateLimitInfo.paused = false;
-        console.log(`🔄 [SyncService] ResumeAt reached, attempting ONE request for product ${i + 1}/${totalProducts}`);
+        sharetribeUserIdValue = userRow.sharetribe_user_id;
+        // Parse location JSON if it exists
+        if (userRow.location) {
+          try {
+            userLocation = JSON.parse(userRow.location);
+          } catch (e) {
+            console.warn('Failed to parse user location JSON:', e.message);
+          }
+        }
+        
+        // Parse parcel JSON if it exists
+        let userParcel = null;
+        if (userRow.parcel) {
+          try {
+            userParcel = JSON.parse(userRow.parcel);
+          } catch (e) {
+            console.warn('Failed to parse user parcel JSON:', e.message);
+          }
+        }
+        
+        // Store user configuration for listing defaults
+        userConfig = {
+          pickupEnabled: userRow.pickup_enabled !== undefined ? Boolean(userRow.pickup_enabled) : true,
+          shippingEnabled: userRow.shipping_enabled !== undefined ? Boolean(userRow.shipping_enabled) : true,
+          shippingMeasurement: userRow.shipping_measurement || 'custom',
+          parcel: userParcel,
+          transactionProcessAlias: userRow.transaction_process_alias || 'default-purchase/release-1',
+          unitType: userRow.unit_type || 'item',
+          defaultImageId: userRow.default_image_id || null,
+          defaultImagePath: userRow.default_image_path || null
+        };
+      } else if (config.sharetribe.userId) {
+        // Fallback to config user ID for backward compatibility
+        sharetribeUserIdValue = config.sharetribe.userId;
       }
+
+      // Use shared API credentials with selected user ID
+      const sharetribeConfig = {
+        apiKey: config.sharetribe.apiKey,
+        apiSecret: config.sharetribe.apiSecret,
+        marketplaceId: config.sharetribe.marketplaceId,
+        userId: sharetribeUserIdValue
+      };
+
+      // Get field mappings
+      const fieldMappings = await this.getFieldMappings(tenantId);
+
+      // Initialize ShareTribe service
+      const sharetribeService = new ShareTribeService(sharetribeConfig);
       
-      // Update progress: starting this product
-      this.updateSyncProgress(syncJobId, {
-        jobId: syncJobId,
-        total: totalProducts,
-        completed: syncedCount,
-        failed: failedCount,
-        percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
-        status: 'in_progress',
-        currentStep: `Syncing product ${productIndex}/${totalProducts}: ${ebayProduct.title || ebayProduct.ebay_item_id}`,
-        eta: this.calculateETA(syncedCount + failedCount, totalProducts, completedTimes, startTime),
-        errors: errors.slice(-10) // Keep last 10 errors
-      });
-      try {
-        // Log product data from database before transformation
-        console.log(`=== SYNC: Product ${ebayProduct.ebay_item_id} from database (AFTER mergeCustomFields) ===`);
-        console.log('Title:', ebayProduct.title);
-        console.log('Description:', ebayProduct.description);
-        console.log('Price:', ebayProduct.price);
-        console.log('Currency:', ebayProduct.currency);
-        console.log('Category:', ebayProduct.category);
-        console.log('CategoryLevel1:', ebayProduct.categoryLevel1);
-        console.log('CategoryLevel2:', ebayProduct.categoryLevel2);
-        console.log('All fields:', Object.keys(ebayProduct));
-        console.log('All values:', JSON.stringify(ebayProduct, null, 2));
+      // Set sync context for event logging
+      sharetribeService.setSyncContext(syncJobId, tenantId, sharetribeUserId, null);
+
+      // Get products from database (not from eBay API)
+      let productsToSync = [];
+      
+      // Helper function to merge custom_fields back into product object
+      // This MUST match the logic in /sync/preview endpoint
+      const mergeCustomFields = (product) => {
+        // Start with the original product object (spread to ensure all properties are enumerable)
+        const completeProduct = { ...product };
         
-        // Apply field mappings
-        // CRITICAL: Pass the EXACT product object to buildSharetribePayload
-        // If applyFieldMappings returns empty, use ebayProduct directly as fallback
-        let transformedProduct = this.applyFieldMappings(ebayProduct, fieldMappings);
+        // Ensure all standard fields are explicitly set (even if null/undefined)
+        completeProduct.title = product.title || null;
+        completeProduct.description = product.description || null;
+        completeProduct.price = product.price !== undefined && product.price !== null ? product.price : null;
+        completeProduct.currency = product.currency || null;
+        completeProduct.quantity = product.quantity !== undefined && product.quantity !== null ? product.quantity : null;
+        completeProduct.images = product.images || null;
+        completeProduct.category = product.category || null;
+        completeProduct.condition = product.condition || null;
+        completeProduct.brand = product.brand || null;
+        completeProduct.sku = product.sku || null;
         
-        // SAFETY CHECK: If transformedProduct is empty or missing critical fields, use original product
-        if (!transformedProduct || Object.keys(transformedProduct).length === 0) {
-          console.error(`❌ FATAL: applyFieldMappings returned empty object for ${ebayProduct.ebay_item_id}. Using original product.`);
-          transformedProduct = { ...ebayProduct };
-          // Remove metadata but keep all data fields
-          const metadataColumns = ['id', 'tenant_id', 'synced', 'sharetribe_listing_id', 'last_synced_at', 'created_at', 'updated_at', 'user_id'];
-          metadataColumns.forEach(col => delete transformedProduct[col]);
-        }
+        console.log(`Sync: Product ${completeProduct.ebay_item_id} from database (before custom_fields merge):`, {
+          title: completeProduct.title,
+          description: completeProduct.description,
+          price: completeProduct.price,
+          currency: completeProduct.currency,
+          hasCustomFields: !!product.custom_fields,
+          allKeys: Object.keys(completeProduct)
+        });
         
-        // Ensure critical fields are present
-        if (!transformedProduct.title && ebayProduct.title) transformedProduct.title = ebayProduct.title;
-        if (!transformedProduct.description && ebayProduct.description) transformedProduct.description = ebayProduct.description;
-        if (transformedProduct.price === undefined && ebayProduct.price !== undefined) transformedProduct.price = ebayProduct.price;
-        if (!transformedProduct.currency && ebayProduct.currency) transformedProduct.currency = ebayProduct.currency;
-        if (!transformedProduct.ebay_item_id && ebayProduct.ebay_item_id) transformedProduct.ebay_item_id = ebayProduct.ebay_item_id;
-        
-        // Ensure custom fields are copied
-        Object.keys(ebayProduct).forEach(key => {
-          if (!['id', 'tenant_id', 'synced', 'sharetribe_listing_id', 'last_synced_at', 'created_at', 'updated_at', 'user_id'].includes(key)) {
-            if (transformedProduct[key] === undefined && ebayProduct[key] !== undefined) {
-              transformedProduct[key] = ebayProduct[key];
+        if (product.custom_fields) {
+          try {
+            const customFields = JSON.parse(product.custom_fields);
+            console.log(`Sync: Custom fields for product ${completeProduct.ebay_item_id}:`, customFields);
+            
+            // Merge ALL custom fields into the product
+            for (const key in customFields) {
+              completeProduct[key] = customFields[key];
             }
+            
+            console.log(`Sync: After merging custom_fields, product ${completeProduct.ebay_item_id} has:`, {
+              categoryLevel1: completeProduct.categoryLevel1,
+              categoryLevel2: completeProduct.categoryLevel2,
+              allKeys: Object.keys(completeProduct),
+              allValues: Object.entries(completeProduct).filter(([k, v]) => v !== null && v !== undefined).map(([k, v]) => `${k}: ${v}`).join(', ')
+            });
+          } catch (e) {
+            console.error(`Error parsing custom_fields for product ${completeProduct.ebay_item_id}:`, e);
           }
+        }
+        
+        // Remove custom_fields from the product object as it's now merged
+        delete completeProduct.custom_fields;
+        return completeProduct;
+      };
+      
+      // CRITICAL: Filter products by user_id to prevent cross-user sync
+      // Only sync products that belong to the specified ShareTribe user
+      const userFilter = sharetribeUserId 
+        ? ' AND user_id = ?'
+        : ' AND user_id IS NULL';
+      
+      const userFilterParams = sharetribeUserId ? [sharetribeUserId] : [];
+      
+      if (itemIds && itemIds.length > 0) {
+        // Sync specific items from database (scoped to user)
+        const placeholders = itemIds.map(() => '?').join(',');
+        productsToSync = await new Promise((resolve, reject) => {
+          dbInstance.all(
+            `SELECT * FROM products WHERE tenant_id = ?${userFilter} AND ebay_item_id IN (${placeholders})`,
+            [tenantId, ...userFilterParams, ...itemIds],
+            (err, rows) => {
+              if (err) {
+                reject(err);
+              } else {
+                // Merge custom_fields back into products
+                const mergedRows = (rows || []).map(mergeCustomFields);
+                // Log first product to debug
+                if (mergedRows && mergedRows.length > 0) {
+                  console.log('Sample product from database:', {
+                    ebay_item_id: mergedRows[0].ebay_item_id,
+                    title: mergedRows[0].title,
+                    price: mergedRows[0].price,
+                    allFields: Object.keys(mergedRows[0]),
+                    categoryLevel1: mergedRows[0].categoryLevel1,
+                    categoryLevel2: mergedRows[0].categoryLevel2,
+                    listingType: mergedRows[0].listingType
+                  });
+                }
+                resolve(mergedRows);
+              }
+            }
+          );
         });
-        
-        console.log(`=== SYNC: Product ${ebayProduct.ebay_item_id} after applyFieldMappings ===`);
-        console.log('Title:', transformedProduct.title);
-        console.log('Description:', transformedProduct.description);
-        console.log('Price:', transformedProduct.price);
-        console.log('Currency:', transformedProduct.currency);
-        console.log('All fields:', Object.keys(transformedProduct));
-        console.log('All values:', JSON.stringify(transformedProduct, null, 2));
-        
-        // Log product data after transformation
-        console.log(`Product ${ebayProduct.ebay_item_id} after transformation:`, {
-          title: transformedProduct.title,
-          price: transformedProduct.price,
-          description: transformedProduct.description,
-          allFields: Object.keys(transformedProduct),
-          allValues: Object.entries(transformedProduct).map(([k, v]) => `${k}: ${v}`).join(', ')
+      } else {
+        // Sync all products from database (scoped to user)
+        productsToSync = await new Promise((resolve, reject) => {
+          dbInstance.all(
+            `SELECT * FROM products WHERE tenant_id = ?${userFilter}`,
+            [tenantId, ...userFilterParams],
+            (err, rows) => {
+              if (err) {
+                reject(err);
+              } else {
+                // Merge custom_fields back into products
+                const mergedRows = (rows || []).map(mergeCustomFields);
+                // Log first product to debug
+                if (mergedRows && mergedRows.length > 0) {
+                  console.log('Sample product from database:', {
+                    ebay_item_id: mergedRows[0].ebay_item_id,
+                    title: mergedRows[0].title,
+                    price: mergedRows[0].price,
+                    allFields: Object.keys(mergedRows[0]),
+                    categoryLevel1: mergedRows[0].categoryLevel1,
+                    categoryLevel2: mergedRows[0].categoryLevel2,
+                    listingType: mergedRows[0].listingType
+                  });
+                }
+                resolve(mergedRows);
+              }
+            }
+          );
         });
-        
-        // Validate required fields before syncing
-        // Check both transformedProduct and ebayProduct as fallback
-        const titleToUse = transformedProduct.title || ebayProduct.title;
-        
-        if (!titleToUse || (typeof titleToUse === 'string' && titleToUse.trim() === '')) {
-          const availableFields = Object.keys(transformedProduct).filter(k => transformedProduct[k] !== null && transformedProduct[k] !== undefined).join(', ');
-          const nullFields = Object.keys(transformedProduct).filter(k => transformedProduct[k] === null).map(k => `${k}(NULL)`).join(', ');
-          const dbFields = Object.keys(ebayProduct).filter(k => ebayProduct[k] !== null && ebayProduct[k] !== undefined).join(', ');
-          const dbNullFields = Object.keys(ebayProduct).filter(k => ebayProduct[k] === null && ['title', 'description', 'price', 'currency', 'quantity'].includes(k)).map(k => `${k}(NULL)`).join(', ');
-          
-          let errorMsg = `Product ${ebayProduct.ebay_item_id} is missing required field: title. `;
-          errorMsg += `Transformed keys: ${Object.keys(transformedProduct).join(', ')}. `;
-          errorMsg += `DB keys: ${Object.keys(ebayProduct).join(', ')}. `;
-          if (availableFields) {
-            errorMsg += `Available fields with values: ${availableFields}. `;
-          }
-          if (nullFields) {
-            errorMsg += `Fields with NULL values: ${nullFields}. `;
-          }
-          if (dbNullFields) {
-            errorMsg += `Database has NULL for: ${dbNullFields}. `;
-          }
-          errorMsg += `This suggests the CSV import did not map columns correctly. Please check your CSV column mappings and ensure "Title" is mapped correctly.`;
-          
-          throw new Error(errorMsg);
-        }
-        
-        // Ensure title is set in transformedProduct (use fallback if needed)
-        if (!transformedProduct.title && titleToUse) {
-          transformedProduct.title = titleToUse;
-        }
-        
-        console.log(`Syncing product ${ebayProduct.ebay_item_id}:`, {
-          title: transformedProduct.title,
-          price: transformedProduct.price,
-          hasDescription: !!transformedProduct.description,
-          allFields: Object.keys(transformedProduct)
-        });
-        
-        // Add user location and configuration to product data if available
-        if (userLocation) {
-          transformedProduct.location = userLocation;
-        }
-        
-        // Add user parcel configuration to product data if available
-        if (userConfig && userConfig.parcel) {
-          transformedProduct.parcel = userConfig.parcel;
-        }
-        
-        // Add user configuration defaults to product data
-        if (userConfig) {
-          console.log(`🔍 [${ebayProduct.ebay_item_id}] Applying userConfig for user ${sharetribeUserId}:`, {
-            hasDefaultImageId: !!userConfig.defaultImageId,
-            defaultImageId: userConfig.defaultImageId,
-            pickupEnabled: userConfig.pickupEnabled,
-            shippingEnabled: userConfig.shippingEnabled
-          });
-          
-          transformedProduct.pickupEnabled = userConfig.pickupEnabled;
-          transformedProduct.shippingEnabled = userConfig.shippingEnabled;
-          transformedProduct.shippingMeasurement = userConfig.shippingMeasurement;
-          transformedProduct.transactionProcessAlias = userConfig.transactionProcessAlias;
-          transformedProduct.unitType = userConfig.unitType;
-          // Store default image path for later upload (we'll upload it fresh for each listing)
-          if (userConfig.defaultImagePath) {
-            transformedProduct.defaultImagePath = userConfig.defaultImagePath;
-            console.log(`✅ Added default image path ${userConfig.defaultImagePath} to product ${ebayProduct.ebay_item_id}`);
-          } else if (userConfig.defaultImageId) {
-            // Fallback: if path not available but ID is, log warning
-            transformedProduct.defaultImageId = userConfig.defaultImageId;
-            console.log(`⚠️ Default image ID available but no file path - image may not work for multiple listings`);
-          } else {
-            console.log(`⚠️ No default image configured for user ${sharetribeUserId}`);
-          }
-        } else {
-          console.warn(`⚠️ [${ebayProduct.ebay_item_id}] userConfig is null/undefined - no user configuration will be applied`);
-          console.warn(`   sharetribeUserId: ${sharetribeUserId}`);
-        }
-        
-        // Sync to ShareTribe (use existing sharetribe_listing_id if product was already synced)
-        const syncStartTime = Date.now();
-        const result = await sharetribeService.createOrUpdateListing(
-          transformedProduct,
-          ebayProduct.sharetribe_listing_id || null
-        );
-        const syncEndTime = Date.now();
-        completedTimes.push(syncEndTime - syncStartTime);
-        
-        // Success! Clear retryAt now that we've successfully processed a request after pause
-        const rateLimitInfo = this.rateLimitStatus.get(syncJobId);
-        if (rateLimitInfo && rateLimitInfo.retryAt) {
-          // We successfully processed a request after resume - clear retryAt and set to RUNNING
-          rateLimitInfo.retryAt = null;
-          rateLimitInfo.nextRetryAt = null;
-          console.log(`✅ Successfully processed product ${ebayProduct.ebay_item_id} after resume, cleared retryAt and setting to RUNNING`);
-          
-          // Now set state to RUNNING since we've successfully processed at least one request
-          this.updateSyncProgress(syncJobId, {
-            jobId: syncJobId,
-            state: 'RUNNING',
-            status: 'in_progress',
-            rateLimited: false,
-            currentStep: `Syncing product ${productIndex}/${totalProducts}: ${ebayProduct.title || ebayProduct.ebay_item_id}`,
-            nextRetryAt: null,
-            retryAt: null,
-            retryInMs: null
-          });
-          
-          // Clear rate limit status (but keep job registered)
-          this.rateLimitStatus.delete(syncJobId);
-        }
-        
-        // Keep only last 10 completion times for rolling average
-        if (completedTimes.length > 10) {
-          completedTimes.shift();
-        }
+      }
 
-        // Update or insert product in database
-        await this.upsertProduct(tenantId, {
-          ...ebayProduct,
-          sharetribe_listing_id: result.listingId,
-          synced: true,
-          last_synced_at: new Date().toISOString(),
-          user_id: sharetribeUserId || null
-        });
-
-        syncedCount++;
-        const processed = syncedCount + failedCount;
-        
-        // Update event logger snapshot
-        await syncEventLogger.updateJobProgress(syncJobId, {
-          state: 'RUNNING',
-          processed: processed,
-          total: totalProducts,
-          completed: syncedCount,
-          failed: failedCount,
-          currentProductId: ebayProduct.ebay_item_id,
-          currentStep: `Synced ${syncedCount}/${totalProducts} products`,
-          retryAt: null,
-          throttleSettings: {
-            minDelayMs: rateLimiter.minRequestInterval || 1000,
-            concurrency: rateLimiter.maxRequestsPerMinute || 100
-          },
-          workspaceId: tenantId,
-          userId: sharetribeUserId || null
-        });
-        
-        // Update progress: product synced successfully
+      // Initialize progress tracking
+      const totalProducts = productsToSync.length;
+      console.log(`📋 [SyncService] Products fetched for job ${syncJobId}: ${totalProducts} products`);
+      console.log(`📋 [SyncService] productsToSync array length:`, productsToSync.length);
+      console.log(`📋 [SyncService] productsToSync sample:`, productsToSync.slice(0, 2));
+      
+      if (totalProducts === 0) {
+        // No products to sync - mark as COMPLETED_SUCCESS (nothing to do = success)
+        console.log(`⚠️ [SyncService] No products to sync for job ${syncJobId}`);
         this.updateSyncProgress(syncJobId, {
           jobId: syncJobId,
-          total: totalProducts,
-          completed: syncedCount,
-          failed: failedCount,
-          percent: Math.round((processed / totalProducts) * 100),
-          status: 'in_progress',
-          currentStep: `Synced ${syncedCount}/${totalProducts} products`,
-          eta: this.calculateETA(processed, totalProducts, completedTimes, startTime),
-          errors: errors.slice(-10)
+          total: 0,
+          completed: 0,
+          failed: 0,
+          processed: 0,
+          remaining: 0,
+          percent: 100,
+          status: 'completed',
+          state: 'COMPLETED_SUCCESS',
+          currentStep: 'No products to sync',
+          eta: 0,
+          errors: []
         });
-      } catch (error) {
-        const now = Date.now();
-        
-        // Check if this is a rate limit error
-        const isRateLimitError = error.message && (
-          error.message.includes('rate limit') || 
-          error.message.includes('429') || 
-          error.message.includes('Too Many Requests') ||
-          error.status === 429 ||
-          (error.response && error.response.status === 429)
-        );
-        
-        const errorCode = (error.response && error.response.status) || error.status || null;
-        const errorMessage = error.message || (error.response && error.response.statusText) || 'Unknown error';
-        
-        if (isRateLimitError) {
-          // Rate limit error - rate limiter's executeRequest should have already called handleRateLimit
-          // Check if we have retryAt set
-          const rateLimitInfo = this.rateLimitStatus.get(syncJobId);
-          if (rateLimitInfo && rateLimitInfo.retryAt) {
-            // Already handled by rate limiter callback - just break and wait
-            console.warn(`⏸️ [SyncService] Rate limit error for product ${ebayProduct.ebay_item_id}, already paused until ${new Date(rateLimitInfo.retryAt).toISOString()}`);
-            break; // Break out of loop - will resume at retryAt
-          } else {
-            // Fallback: compute retryAt from Retry-After header
-            const retryAfterHeader = error.response?.headers?.['retry-after'] || 
-                                     error.response?.headers?.['Retry-After'] || 
-                                     15; // Default 15 seconds (minPauseSeconds)
-            const retryAfterMs = parseInt(retryAfterHeader) * 1000;
-            const retryAt = now + retryAfterMs + 1500; // Add safety buffer
-            
-            // Call handleRateLimit to set PAUSED state
-            this.handleRateLimit(syncJobId, retryAt, errorCode, errorMessage);
-            break; // Break out of loop - will resume at retryAt
-          }
-        } else {
-          // Non-rate-limit error - mark as failed
-          failedCount++;
-          
-          const errorInfo = {
-            itemId: ebayProduct.ebay_item_id,
-            title: ebayProduct.title || 'Unknown',
-            error: errorMessage
-          };
-          errors.push(errorInfo);
-          
-          // Update progress: product failed
-          this.updateSyncProgress(syncJobId, {
-            jobId: syncJobId,
-            total: totalProducts,
-            completed: syncedCount,
-            failed: failedCount,
-            percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
-            status: 'in_progress',
-            state: 'running',
-            currentStep: `Failed: ${ebayProduct.title || ebayProduct.ebay_item_id}`,
-            eta: this.calculateETA(syncedCount + failedCount, totalProducts, completedTimes, startTime),
-            lastAttemptAt: now,
-            lastErrorCode: errorCode,
-            lastErrorMessage: errorMessage,
-            errors: errors.slice(-10)
-          });
-          
-          console.error(`❌ Error syncing product ${ebayProduct.ebay_item_id}:`, error);
-        }
+        rateLimiter.unregisterSyncJob(syncJobId);
+        rateLimiter.unregisterRateLimitCallback(syncJobId);
+        return {
+          success: true,
+          synced: 0,
+          failed: 0,
+          errors: [],
+          jobId: syncJobId
+        };
       }
-    }
-
-    // Final progress update
-    // Only mark COMPLETED if processed === total (100%)
-    // Otherwise, keep RUNNING or PAUSED so job can auto-continue
-    const finalProcessed = syncedCount + failedCount; // All items have been attempted
-    const finalPercent = totalProducts > 0 ? Math.round((finalProcessed / totalProducts) * 100) : 100;
-    const remaining = totalProducts - finalProcessed;
-    
-    // Sanity check: Only COMPLETED if processed === total (100%)
-    // If processed < total, keep job active (RUNNING or PAUSED) so it can auto-continue
-    if (finalProcessed === totalProducts) {
-      // All items processed - mark as COMPLETED
+      
+      let syncedCount = 0;
+      let failedCount = 0;
+      const errors = [];
+      const startTime = Date.now();
+      const completedTimes = []; // Track completion times for ETA calculation
+      
+      // Update progress with actual product count (progress was initialized in API route)
+      // Store sharetribeUserId in progress for resume continuation
+      console.log(`📋 [SyncService] Updating progress for job ${syncJobId} with ${totalProducts} products`);
+      
+      // Persist job record with totalProducts set
       await syncEventLogger.updateJobProgress(syncJobId, {
-        state: 'COMPLETED',
-        processed: finalProcessed,
-        total: totalProducts,
-        completed: syncedCount,
-        failed: failedCount,
+        state: 'RUNNING',
+        processed: 0,
+        total: totalProducts, // Set totalProducts now
+        completed: 0,
+        failed: 0,
         currentProductId: null,
-        currentStep: 'Sync completed',
+        currentStep: `Starting sync of ${totalProducts} product(s)...`,
         retryAt: null,
         throttleSettings: {
           minDelayMs: rateLimiter.minRequestInterval || 1000,
@@ -886,94 +538,699 @@ class SyncService {
       
       this.updateSyncProgress(syncJobId, {
         jobId: syncJobId,
-        total: totalProducts, // Locked total (set at job start)
-        completed: syncedCount,
-        failed: failedCount,
-        processed: finalProcessed,
-        remaining: 0,
-        percent: 100,
-        status: 'completed',
-        state: 'COMPLETED',
-        currentStep: 'Sync completed',
-        eta: 0,
-        errors: errors
-      });
-    } else {
-      // Not fully processed - keep job active (will auto-continue)
-      // Set to PAUSED with resumeAt so UI shows countdown
-      const resumeAt = Date.now() + 5000; // Resume in 5s
-      this.updateSyncProgress(syncJobId, {
-        jobId: syncJobId,
         total: totalProducts,
-        completed: syncedCount,
-        failed: failedCount,
-        processed: finalProcessed,
-        remaining: remaining,
-        percent: finalPercent,
-        status: 'retry_scheduled',
-        state: 'PAUSED', // Keep PAUSED so job can auto-continue
-        nextRetryAt: resumeAt,
-        retryAt: resumeAt,
-        currentStep: 'Sync will continue automatically',
+        completed: 0,
+        failed: 0,
+        percent: 0,
+        status: 'in_progress',
+        state: 'RUNNING',
+        sharetribeUserId: sharetribeUserId, // Store for resume continuation
+        currentStep: `Starting sync of ${totalProducts} product(s)...`,
         eta: null,
-        errors: errors
+        errors: [],
+        workspaceId: tenantId,
+        userId: sharetribeUserId || null
       });
       
-      // Job will auto-continue when resumeAt is reached (handled in sync loop)
-      console.log(`⏸️ [SyncService] Job ${syncJobId} not fully processed (${finalProcessed}/${totalProducts}), keeping active and paused until ${new Date(resumeAt).toISOString()}`);
-      return; // Don't unregister job - it will continue
-    }
-    
-    // Unregister sync job and rate limit callback
-    rateLimiter.unregisterSyncJob(syncJobId);
-    rateLimiter.unregisterRateLimitCallback(syncJobId);
-    this.clearRateLimitStatus(syncJobId);
-    
-    // Clear progress after 5 minutes (keep it for a bit in case UI needs to refresh)
-    setTimeout(() => {
-      this.clearSyncProgress(syncJobId);
-    }, 5 * 60 * 1000);
+      console.log(`🚀 Starting sync job ${syncJobId}: ${totalProducts} products to sync`);
+      console.log(`📋 [SyncService] Progress updated - total: ${totalProducts}`);
 
-    return {
-      success: true,
-      synced: syncedCount,
-      failed: failedCount,
-      errors: errors,
-      jobId: syncJobId
-    };
-    } catch (error) {
-      console.error('❌ Error syncing products:', error);
-      console.error('Error stack:', error.stack);
+      for (let i = 0; i < productsToSync.length; i++) {
+        const ebayProduct = productsToSync[i];
+        const productIndex = i + 1;
+        
+        // Check if we're paused due to rate limit - check both in-memory and DB
+        let rateLimitInfo = this.rateLimitStatus.get(syncJobId);
+        let retryAt = null;
+        
+        // First check in-memory state
+        if (rateLimitInfo && rateLimitInfo.paused && rateLimitInfo.retryAt) {
+          retryAt = rateLimitInfo.retryAt;
+        } else {
+          // Check DB for paused state (in case process restarted)
+          const dbProgress = await syncEventLogger.getJobSnapshotFromDB(syncJobId);
+          if (dbProgress && dbProgress.state === 'PAUSED_RATE_LIMIT' && dbProgress.retry_at) {
+            retryAt = typeof dbProgress.retry_at === 'number' ? dbProgress.retry_at : new Date(dbProgress.retry_at).getTime();
+            // Restore in-memory state
+            if (!rateLimitInfo) {
+              rateLimitInfo = {};
+              this.rateLimitStatus.set(syncJobId, rateLimitInfo);
+            }
+            rateLimitInfo.paused = true;
+            rateLimitInfo.retryAt = retryAt;
+            console.log(`🔄 [SyncService] Restored paused state from DB for job ${syncJobId}, retryAt: ${new Date(retryAt).toISOString()}`);
+          }
+        }
+        
+        if (retryAt) {
+          const now = Date.now();
+          
+          if (now < retryAt) {
+            // Still waiting - update progress with heartbeat and wait
+            const retryInMs = Math.max(0, retryAt - now);
+            const retryInSeconds = Math.ceil(retryInMs / 1000);
+            
+            // Log pause start
+            console.log(`⏸️ [SyncService] PAUSED start - jobId: ${syncJobId}, retryInSeconds: ${retryInSeconds}, current index i: ${i}, product: ${i + 1}/${totalProducts}`);
+            
+            // Update progress with heartbeat (persist to DB)
+            this.updateSyncProgress(syncJobId, {
+              jobId: syncJobId,
+              total: totalProducts,
+              completed: syncedCount,
+              failed: failedCount,
+              processed: syncedCount + failedCount,
+              percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
+              state: 'PAUSED_RATE_LIMIT', // Use specific state for rate limits
+              status: 'paused',
+              nextRetryAt: retryAt,
+              retryAt: retryAt,
+              retryInMs: retryInMs,
+              retryInSeconds: retryInSeconds,
+              rateLimited: true,
+              rateLimitCount: rateLimitInfo?.rateLimitCount || 0,
+              currentStep: `Sharetribe API limit reached (100 requests/min). Sync will resume in ${formatTime(retryInSeconds)}.`,
+              eta: null,
+              errors: errors.slice(-10),
+              updatedAt: now // Heartbeat update
+            });
+            
+            // Persist to DB with heartbeat
+            await syncEventLogger.updateJobProgress(syncJobId, {
+              state: 'PAUSED_RATE_LIMIT',
+              retryAt: retryAt,
+              updatedAt: now,
+              currentStep: `Sharetribe API limit reached (100 requests/min). Sync will resume in ${formatTime(retryInSeconds)}.`
+            }).catch(err => {
+              console.error(`[SyncService] Error persisting pause state:`, err);
+            });
+            
+            // Wait until retry time (with periodic heartbeat updates)
+            const waitStartTime = now;
+            const heartbeatInterval = 3000; // Update every 3 seconds
+            
+            while (Date.now() < retryAt) {
+              const remainingMs = Math.max(0, retryAt - Date.now());
+              const waitMs = Math.min(remainingMs, heartbeatInterval);
+              
+              await new Promise(resolve => setTimeout(resolve, waitMs));
+              
+              // Heartbeat update while waiting
+              const currentNow = Date.now();
+              if (currentNow < retryAt) {
+                const currentRetryInSeconds = Math.ceil((retryAt - currentNow) / 1000);
+                await syncEventLogger.updateJobProgress(syncJobId, {
+                  state: 'PAUSED_RATE_LIMIT',
+                  retryAt: retryAt,
+                  updatedAt: currentNow,
+                  currentStep: `Sharetribe API limit reached (100 requests/min). Sync will resume in ${formatTime(currentRetryInSeconds)}.`
+                }).catch(() => {}); // Ignore errors in heartbeat
+              }
+            }
+          }
+          
+          // After wait, clear pause flag and update state to RUNNING
+          const resumeNow = Date.now();
+          const resumeRetryInSeconds = Math.ceil((retryAt - resumeNow) / 1000);
+          
+          // Log resume
+          console.log(`▶️ [SyncService] RESUMED at ${new Date(resumeNow).toISOString()} - jobId: ${syncJobId}, now>=retryAt: ${resumeNow >= retryAt}, continuing i=${i}, product: ${i + 1}/${totalProducts}, retryInSeconds was: ${resumeRetryInSeconds}`);
+          
+          if (rateLimitInfo) {
+            rateLimitInfo.paused = false;
+          }
+          
+          // Update state to RUNNING and persist to DB
+          await syncEventLogger.updateJobProgress(syncJobId, {
+            state: 'RUNNING',
+            updatedAt: resumeNow,
+            currentStep: `Resuming sync after rate limit pause...`
+          }).catch(() => {});
+          
+          this.updateSyncProgress(syncJobId, {
+            jobId: syncJobId,
+            state: 'RUNNING',
+            status: 'in_progress',
+            retryAt: null,
+            nextRetryAt: null,
+            updatedAt: resumeNow
+          });
+        }
+        
+        // Update progress: starting this product
+        this.updateSyncProgress(syncJobId, {
+          jobId: syncJobId,
+          total: totalProducts,
+          completed: syncedCount,
+          failed: failedCount,
+          percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
+          status: 'in_progress',
+          currentStep: `Syncing product ${productIndex}/${totalProducts}: ${ebayProduct.title || ebayProduct.ebay_item_id}`,
+          eta: this.calculateETA(syncedCount + failedCount, totalProducts, completedTimes, startTime),
+          errors: errors.slice(-10) // Keep last 10 errors
+        });
+        try {
+          // Log product data from database before transformation
+          console.log(`=== SYNC: Product ${ebayProduct.ebay_item_id} from database (AFTER mergeCustomFields) ===`);
+          console.log('Title:', ebayProduct.title);
+          console.log('Description:', ebayProduct.description);
+          console.log('Price:', ebayProduct.price);
+          console.log('Currency:', ebayProduct.currency);
+          console.log('Category:', ebayProduct.category);
+          console.log('CategoryLevel1:', ebayProduct.categoryLevel1);
+          console.log('CategoryLevel2:', ebayProduct.categoryLevel2);
+          console.log('All fields:', Object.keys(ebayProduct));
+          console.log('All values:', JSON.stringify(ebayProduct, null, 2));
+          
+          // Apply field mappings
+          // CRITICAL: Pass the EXACT product object to buildSharetribePayload
+          // If applyFieldMappings returns empty, use ebayProduct directly as fallback
+          let transformedProduct = this.applyFieldMappings(ebayProduct, fieldMappings);
+          
+          // SAFETY CHECK: If transformedProduct is empty or missing critical fields, use original product
+          if (!transformedProduct || Object.keys(transformedProduct).length === 0) {
+            console.error(`❌ FATAL: applyFieldMappings returned empty object for ${ebayProduct.ebay_item_id}. Using original product.`);
+            transformedProduct = { ...ebayProduct };
+            // Remove metadata but keep all data fields
+            const metadataColumns = ['id', 'tenant_id', 'synced', 'sharetribe_listing_id', 'last_synced_at', 'created_at', 'updated_at', 'user_id'];
+            metadataColumns.forEach(col => delete transformedProduct[col]);
+          }
+          
+          // Ensure critical fields are present
+          if (!transformedProduct.title && ebayProduct.title) transformedProduct.title = ebayProduct.title;
+          if (!transformedProduct.description && ebayProduct.description) transformedProduct.description = ebayProduct.description;
+          if (transformedProduct.price === undefined && ebayProduct.price !== undefined) transformedProduct.price = ebayProduct.price;
+          if (!transformedProduct.currency && ebayProduct.currency) transformedProduct.currency = ebayProduct.currency;
+          if (!transformedProduct.ebay_item_id && ebayProduct.ebay_item_id) transformedProduct.ebay_item_id = ebayProduct.ebay_item_id;
+          
+          // Ensure custom fields are copied
+          Object.keys(ebayProduct).forEach(key => {
+            if (!['id', 'tenant_id', 'synced', 'sharetribe_listing_id', 'last_synced_at', 'created_at', 'updated_at', 'user_id'].includes(key)) {
+              if (transformedProduct[key] === undefined && ebayProduct[key] !== undefined) {
+                transformedProduct[key] = ebayProduct[key];
+              }
+            }
+          });
+          
+          console.log(`=== SYNC: Product ${ebayProduct.ebay_item_id} after applyFieldMappings ===`);
+          console.log('Title:', transformedProduct.title);
+          console.log('Description:', transformedProduct.description);
+          console.log('Price:', transformedProduct.price);
+          console.log('Currency:', transformedProduct.currency);
+          console.log('All fields:', Object.keys(transformedProduct));
+          console.log('All values:', JSON.stringify(transformedProduct, null, 2));
+          
+          // Log product data after transformation
+          console.log(`Product ${ebayProduct.ebay_item_id} after transformation:`, {
+            title: transformedProduct.title,
+            price: transformedProduct.price,
+            description: transformedProduct.description,
+            allFields: Object.keys(transformedProduct),
+            allValues: Object.entries(transformedProduct).map(([k, v]) => `${k}: ${v}`).join(', ')
+          });
+          
+          // Validate required fields before syncing
+          // Check both transformedProduct and ebayProduct as fallback
+          const titleToUse = transformedProduct.title || ebayProduct.title;
+          
+          if (!titleToUse || (typeof titleToUse === 'string' && titleToUse.trim() === '')) {
+            const availableFields = Object.keys(transformedProduct).filter(k => transformedProduct[k] !== null && transformedProduct[k] !== undefined).join(', ');
+            const nullFields = Object.keys(transformedProduct).filter(k => transformedProduct[k] === null).map(k => `${k}(NULL)`).join(', ');
+            const dbFields = Object.keys(ebayProduct).filter(k => ebayProduct[k] !== null && ebayProduct[k] !== undefined).join(', ');
+            const dbNullFields = Object.keys(ebayProduct).filter(k => ebayProduct[k] === null && ['title', 'description', 'price', 'currency', 'quantity'].includes(k)).map(k => `${k}(NULL)`).join(', ');
+            
+            let errorMsg = `Product ${ebayProduct.ebay_item_id} is missing required field: title. `;
+            errorMsg += `Transformed keys: ${Object.keys(transformedProduct).join(', ')}. `;
+            errorMsg += `DB keys: ${Object.keys(ebayProduct).join(', ')}. `;
+            if (availableFields) {
+              errorMsg += `Available fields with values: ${availableFields}. `;
+            }
+            if (nullFields) {
+              errorMsg += `Fields with NULL values: ${nullFields}. `;
+            }
+            if (dbNullFields) {
+              errorMsg += `Database has NULL for: ${dbNullFields}. `;
+            }
+            errorMsg += `This suggests the CSV import did not map columns correctly. Please check your CSV column mappings and ensure "Title" is mapped correctly.`;
+            
+            throw new Error(errorMsg);
+          }
+          
+          // Ensure title is set in transformedProduct (use fallback if needed)
+          if (!transformedProduct.title && titleToUse) {
+            transformedProduct.title = titleToUse;
+          }
+          
+          console.log(`Syncing product ${ebayProduct.ebay_item_id}:`, {
+            title: transformedProduct.title,
+            price: transformedProduct.price,
+            hasDescription: !!transformedProduct.description,
+            allFields: Object.keys(transformedProduct)
+          });
+          
+          // Add user location and configuration to product data if available
+          if (userLocation) {
+            transformedProduct.location = userLocation;
+          }
+          
+          // Add user parcel configuration to product data if available
+          if (userConfig && userConfig.parcel) {
+            transformedProduct.parcel = userConfig.parcel;
+          }
+          
+          // Add user configuration defaults to product data
+          if (userConfig) {
+            console.log(`🔍 [${ebayProduct.ebay_item_id}] Applying userConfig for user ${sharetribeUserId}:`, {
+              hasDefaultImageId: !!userConfig.defaultImageId,
+              defaultImageId: userConfig.defaultImageId,
+              pickupEnabled: userConfig.pickupEnabled,
+              shippingEnabled: userConfig.shippingEnabled
+            });
+            
+            transformedProduct.pickupEnabled = userConfig.pickupEnabled;
+            transformedProduct.shippingEnabled = userConfig.shippingEnabled;
+            transformedProduct.shippingMeasurement = userConfig.shippingMeasurement;
+            transformedProduct.transactionProcessAlias = userConfig.transactionProcessAlias;
+            transformedProduct.unitType = userConfig.unitType;
+            // Store default image path for later upload (we'll upload it fresh for each listing)
+            if (userConfig.defaultImagePath) {
+              transformedProduct.defaultImagePath = userConfig.defaultImagePath;
+              console.log(`✅ Added default image path ${userConfig.defaultImagePath} to product ${ebayProduct.ebay_item_id}`);
+            } else if (userConfig.defaultImageId) {
+              // Fallback: if path not available but ID is, log warning
+              transformedProduct.defaultImageId = userConfig.defaultImageId;
+              console.log(`⚠️ Default image ID available but no file path - image may not work for multiple listings`);
+            } else {
+              console.log(`⚠️ No default image configured for user ${sharetribeUserId}`);
+            }
+          } else {
+            console.warn(`⚠️ [${ebayProduct.ebay_item_id}] userConfig is null/undefined - no user configuration will be applied`);
+            console.warn(`   sharetribeUserId: ${sharetribeUserId}`);
+          }
+          
+          // Sync to ShareTribe (use existing sharetribe_listing_id if product was already synced)
+          const syncStartTime = Date.now();
+          const result = await sharetribeService.createOrUpdateListing(
+            transformedProduct,
+            ebayProduct.sharetribe_listing_id || null
+          );
+          const syncEndTime = Date.now();
+          completedTimes.push(syncEndTime - syncStartTime);
+          
+          // Success! Clear retryAt now that we've successfully processed a request after pause
+          const rateLimitInfo = this.rateLimitStatus.get(syncJobId);
+          if (rateLimitInfo && rateLimitInfo.retryAt) {
+            // We successfully processed a request after resume - clear retryAt and set to RUNNING
+            rateLimitInfo.retryAt = null;
+            rateLimitInfo.nextRetryAt = null;
+            console.log(`✅ Successfully processed product ${ebayProduct.ebay_item_id} after resume, cleared retryAt and setting to RUNNING`);
+            
+            // Now set state to RUNNING since we've successfully processed at least one request
+            this.updateSyncProgress(syncJobId, {
+              jobId: syncJobId,
+              state: 'RUNNING',
+              status: 'in_progress',
+              rateLimited: false,
+              currentStep: `Syncing product ${productIndex}/${totalProducts}: ${ebayProduct.title || ebayProduct.ebay_item_id}`,
+              nextRetryAt: null,
+              retryAt: null,
+              retryInMs: null
+            });
+            
+            // Clear rate limit status (but keep job registered)
+            this.rateLimitStatus.delete(syncJobId);
+          }
+          
+          // Keep only last 10 completion times for rolling average
+          if (completedTimes.length > 10) {
+            completedTimes.shift();
+          }
+
+          // Update or insert product in database
+          await this.upsertProduct(tenantId, {
+            ...ebayProduct,
+            sharetribe_listing_id: result.listingId,
+            synced: true,
+            last_synced_at: new Date().toISOString(),
+            user_id: sharetribeUserId || null
+          });
+
+          syncedCount++;
+          const processed = syncedCount + failedCount;
+          
+          // Update event logger snapshot
+          await syncEventLogger.updateJobProgress(syncJobId, {
+            state: 'RUNNING',
+            processed: processed,
+            total: totalProducts,
+            completed: syncedCount,
+            failed: failedCount,
+            currentProductId: ebayProduct.ebay_item_id,
+            currentStep: `Synced ${syncedCount}/${totalProducts} products`,
+            retryAt: null,
+            throttleSettings: {
+              minDelayMs: rateLimiter.minRequestInterval || 1000,
+              concurrency: rateLimiter.maxRequestsPerMinute || 100
+            },
+            workspaceId: tenantId,
+            userId: sharetribeUserId || null
+          });
+          
+          // Update progress: product synced successfully
+          this.updateSyncProgress(syncJobId, {
+            jobId: syncJobId,
+            total: totalProducts,
+            completed: syncedCount,
+            failed: failedCount,
+            percent: Math.round((processed / totalProducts) * 100),
+            status: 'in_progress',
+            currentStep: `Synced ${syncedCount}/${totalProducts} products`,
+            eta: this.calculateETA(processed, totalProducts, completedTimes, startTime),
+            errors: errors.slice(-10)
+          });
+        } catch (error) {
+          const now = Date.now();
+          
+          // Check if this is a rate limit error
+          const isRateLimitError = error.message && (
+            error.message.includes('rate limit') || 
+            error.message.includes('429') || 
+            error.message.includes('Too Many Requests') ||
+            error.status === 429 ||
+            (error.response && error.response.status === 429)
+          );
+          
+          const errorCode = (error.response && error.response.status) || error.status || null;
+          const errorMessage = error.message || (error.response && error.response.statusText) || 'Unknown error';
+          
+          if (isRateLimitError) {
+            // Rate limit error (429) - treat as retryable, do NOT mark as failed
+            console.warn(`⏸️ [SyncService] Rate limit error (429) for product ${ebayProduct.ebay_item_id}`);
+            
+            // Get retry count for this product
+            let productRetries = this.productRetryAttempts.get(syncJobId);
+            if (!productRetries) {
+              productRetries = new Map();
+              this.productRetryAttempts.set(syncJobId, productRetries);
+            }
+            const productRetryCount = productRetries.get(ebayProduct.ebay_item_id) || 0;
+            
+            // Check if max retries exceeded
+            if (productRetryCount >= this.MAX_RETRY_ATTEMPTS) {
+              console.error(`❌ [SyncService] Max retry attempts (${this.MAX_RETRY_ATTEMPTS}) exceeded for product ${ebayProduct.ebay_item_id}, marking as failed`);
+              failedCount++;
+              const errorInfo = {
+                itemId: ebayProduct.ebay_item_id,
+                title: ebayProduct.title || 'Unknown',
+                error: `Rate limit retry failed after ${this.MAX_RETRY_ATTEMPTS} attempts`
+              };
+              errors.push(errorInfo);
+              
+              // Update progress: product failed after max retries
+              this.updateSyncProgress(syncJobId, {
+                jobId: syncJobId,
+                total: totalProducts,
+                completed: syncedCount,
+                failed: failedCount,
+                percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
+                status: 'in_progress',
+                state: 'RUNNING',
+                currentStep: `Max retries exceeded for ${ebayProduct.title || ebayProduct.ebay_item_id}`,
+                eta: this.calculateETA(syncedCount + failedCount, totalProducts, completedTimes, startTime),
+                errors: errors.slice(-10)
+              });
+              
+              // Continue to next product
+              continue;
+            }
+            
+            // Increment retry count for this product
+            productRetries.set(ebayProduct.ebay_item_id, productRetryCount + 1);
+            
+            // Calculate retryAt
+            const retryAfterHeader = error.response?.headers?.['retry-after'] || 
+                                     error.response?.headers?.['Retry-After'];
+            
+            // Extract endpoint info from error
+            const endpoint = error.config?.url || error.response?.config?.url || 'unknown';
+            
+            let retryAt;
+            if (retryAfterHeader) {
+              // Use Retry-After header with safety buffer
+              const retryAfterSeconds = parseInt(retryAfterHeader);
+              retryAt = now + (retryAfterSeconds * 1000) + 1500; // Add 1500ms buffer
+              console.log(`⏸️ [SyncService] Using Retry-After header: ${retryAfterSeconds}s + 1500ms buffer`);
+            } else {
+              // Fallback to exponential backoff
+              const backoffMs = this.calculateExponentialBackoff(productRetryCount);
+              retryAt = now + backoffMs;
+              console.log(`⏸️ [SyncService] No Retry-After header, using exponential backoff: ${Math.ceil(backoffMs / 1000)}s (attempt ${productRetryCount + 1})`);
+            }
+            
+            // Log 429 occurrence with all details
+            console.log(`🚨 [SyncService] 429 OCCURRED - jobId: ${syncJobId}, endpoint: ${endpoint}, retryAt: ${new Date(retryAt).toISOString()}, retryAfterHeader: "${retryAfterHeader || 'none'}", current index i: ${i}, product: ${i + 1}/${totalProducts}`);
+            
+            // Call handleRateLimit to set PAUSED_RATE_LIMIT state (await to ensure DB persistence)
+            await this.handleRateLimit(syncJobId, retryAt, errorCode, errorMessage, retryAfterHeader);
+            
+            // Decrement i to retry the same product after pause
+            i--; // Will be incremented by for loop, so this retries the same product
+            console.log(`🔄 [SyncService] Will retry product ${ebayProduct.ebay_item_id} after pause (attempt ${productRetryCount + 1}/${this.MAX_RETRY_ATTEMPTS})`);
+            
+            // Continue to restart loop - will hit pause check at top, wait until retryAt, then retry same product
+            continue;
+          } else {
+            // Check if error is retryable (400/401/403/404 are NOT retryable)
+            const isRetryableError = errorCode !== 400 && errorCode !== 401 && errorCode !== 403 && errorCode !== 404;
+            
+            if (!isRetryableError) {
+              // Non-retryable error (validation/auth) - mark as failed immediately
+              console.error(`❌ [SyncService] Non-retryable error (${errorCode}) for product ${ebayProduct.ebay_item_id}: ${errorMessage}`);
+              failedCount++;
+            
+            const errorInfo = {
+              itemId: ebayProduct.ebay_item_id,
+              title: ebayProduct.title || 'Unknown',
+              error: errorMessage
+            };
+            errors.push(errorInfo);
+            
+            // Update progress: product failed
+            this.updateSyncProgress(syncJobId, {
+              jobId: syncJobId,
+              total: totalProducts,
+              completed: syncedCount,
+              failed: failedCount,
+              percent: Math.round(((syncedCount + failedCount) / totalProducts) * 100),
+              status: 'in_progress',
+              state: 'running',
+              currentStep: `Failed: ${ebayProduct.title || ebayProduct.ebay_item_id}`,
+              eta: this.calculateETA(syncedCount + failedCount, totalProducts, completedTimes, startTime),
+              lastAttemptAt: now,
+              lastErrorCode: errorCode,
+              lastErrorMessage: errorMessage,
+              errors: errors.slice(-10)
+            });
+            
+            console.error(`❌ Error syncing product ${ebayProduct.ebay_item_id}:`, error);
+          }
+        }
+      }
+    }
+
+    // Final progress update
+      // Only mark COMPLETED if processed === total (100%)
+      // Otherwise, keep RUNNING or PAUSED so job can auto-continue
+      const finalProcessed = syncedCount + failedCount; // All items have been attempted
+      const finalPercent = totalProducts > 0 ? Math.round((finalProcessed / totalProducts) * 100) : 100;
+      const remaining = totalProducts - finalProcessed;
       
-      // Update progress: sync failed
-      const currentProgress = this.getSyncProgress(syncJobId);
-      const totalProducts = currentProgress?.total || 0;
-      this.updateSyncProgress(syncJobId, {
-        jobId: syncJobId,
-        total: totalProducts,
-        completed: currentProgress?.completed || 0,
-        failed: currentProgress?.failed || 0,
-        percent: currentProgress?.percent || 0,
-        status: 'error',
-        currentStep: `Error: ${error.message}`,
-        eta: null,
-        errors: currentProgress?.errors || [{ itemId: 'SYNC_ERROR', error: error.message }]
-      });
+      // Sanity check: Only COMPLETED if processed === total (100%)
+      // If processed < total, keep job active (RUNNING or PAUSED) so it can auto-continue
+      if (finalProcessed === totalProducts) {
+        // All items processed - mark as COMPLETED
+        await syncEventLogger.updateJobProgress(syncJobId, {
+          state: 'COMPLETED',
+          processed: finalProcessed,
+          total: totalProducts,
+          completed: syncedCount,
+          failed: failedCount,
+          currentProductId: null,
+          currentStep: 'Sync completed',
+          retryAt: null,
+          throttleSettings: {
+            minDelayMs: rateLimiter.minRequestInterval || 1000,
+            concurrency: rateLimiter.maxRequestsPerMinute || 100
+          },
+          workspaceId: tenantId,
+          userId: sharetribeUserId || null
+        });
+        
+        this.updateSyncProgress(syncJobId, {
+          jobId: syncJobId,
+          total: totalProducts, // Locked total (set at job start)
+          completed: syncedCount,
+          failed: failedCount,
+          processed: finalProcessed,
+          remaining: 0,
+          percent: 100,
+          status: 'completed',
+          state: 'COMPLETED',
+          currentStep: 'Sync completed',
+          eta: 0,
+          errors: errors
+        });
+      } else {
+        // Not fully processed - this should never happen if loop logic is correct
+        // If we reach here, it means the loop exited early (shouldn't happen)
+        console.error(`❌ [SyncService] Job ${syncJobId} reached end of syncProducts but not fully processed (${finalProcessed}/${totalProducts}). This indicates a bug in the loop logic.`);
+        
+        // Mark as FAILED since we can't auto-continue without a resume mechanism
+        await syncEventLogger.updateJobProgress(syncJobId, {
+          state: 'FAILED',
+          processed: finalProcessed,
+          total: totalProducts,
+          completed: syncedCount,
+          failed: failedCount,
+          currentProductId: null,
+          currentStep: `Sync stopped unexpectedly (${finalProcessed}/${totalProducts} processed)`,
+          retryAt: null
+        });
+        
+        this.updateSyncProgress(syncJobId, {
+          jobId: syncJobId,
+          total: totalProducts,
+          completed: syncedCount,
+          failed: failedCount,
+          processed: finalProcessed,
+          remaining: remaining,
+          percent: finalPercent,
+          status: 'error',
+          state: 'FAILED',
+          currentStep: `Sync stopped unexpectedly (${finalProcessed}/${totalProducts} processed)`,
+          eta: null,
+          errors: errors
+        });
+      }
       
       // Unregister sync job and rate limit callback
       rateLimiter.unregisterSyncJob(syncJobId);
       rateLimiter.unregisterRateLimitCallback(syncJobId);
       this.clearRateLimitStatus(syncJobId);
       
-      throw error;
+      // Clear progress after 5 minutes (keep it for a bit in case UI needs to refresh)
+      setTimeout(() => {
+        this.clearSyncProgress(syncJobId);
+      }, 5 * 60 * 1000);
+
+      return {
+        success: true,
+        synced: syncedCount,
+        failed: failedCount,
+        errors: errors,
+        jobId: syncJobId
+      };
+    } catch (error) {
+      console.error('❌ Error syncing products:', error);
+      console.error('Error stack:', error.stack);
+      
+      // Get current progress safely
+      const currentProgress = this.getSyncProgress(syncJobId) || {};
+      const totalProducts = currentProgress.total || 0;
+      const currentCompleted = currentProgress.completed || 0;
+      const currentFailed = currentProgress.failed || 0;
+      const currentPercent = currentProgress.percent || 0;
+      const currentErrors = currentProgress.errors || [];
+      
+      // Check if this is a rate limit error (429) - should pause, not fail
+      const isRateLimitError = error.response?.status === 429 || 
+                               error.status === 429 ||
+                               error.message?.includes('rate limit') ||
+                               error.message?.includes('429') ||
+                               error.message?.includes('Too Many Requests');
+      
+      if (isRateLimitError) {
+        // 429 error - pause and resume, don't fail
+        console.warn(`⏸️ [SyncService] Rate limit error (429) caught in outer catch - pausing sync job ${syncJobId}`);
+        
+        // Calculate retryAt
+        const now = Date.now();
+        const retryAfterHeader = error.response?.headers?.['retry-after'] || 
+                                 error.response?.headers?.['Retry-After'];
+        
+        let retryAt;
+        if (retryAfterHeader) {
+          const retryAfterSeconds = parseInt(retryAfterHeader);
+          retryAt = now + (retryAfterSeconds * 1000) + 1500; // Add 1500ms buffer
+        } else {
+          // Default backoff: 15 seconds
+          retryAt = now + 15000;
+        }
+        
+        // Set to PAUSED_RATE_LIMIT state - sync will resume automatically (await to ensure DB persistence)
+        await this.handleRateLimit(syncJobId, retryAt, 429, error.message || 'Rate limit exceeded', retryAfterHeader);
+        
+        // Update progress to show paused state
+        this.updateSyncProgress(syncJobId, {
+          jobId: syncJobId,
+          total: totalProducts,
+          completed: currentCompleted,
+          failed: currentFailed,
+          percent: currentPercent,
+          status: 'paused',
+          state: 'PAUSED_RATE_LIMIT',
+          currentStep: `Rate limit reached. Sync will resume automatically in ${Math.ceil((retryAt - now) / 1000)}s`,
+          eta: null,
+          errors: currentErrors,
+          nextRetryAt: retryAt,
+          retryAt: retryAt,
+          retryInMs: retryAt - now
+        });
+        
+        // Don't unregister job - it will resume automatically
+        // Don't throw error - let the job stay active so it can resume
+        return {
+          success: false,
+          synced: currentCompleted,
+          failed: currentFailed,
+          errors: currentErrors,
+          jobId: syncJobId,
+          paused: true,
+          retryAt: retryAt
+        };
+      } else {
+        // Non-rate-limit error - mark as FAILED
+        const finalState = 'FAILED';
+        
+        this.updateSyncProgress(syncJobId, {
+          jobId: syncJobId,
+          total: totalProducts,
+          completed: currentCompleted,
+          failed: currentFailed,
+          percent: currentPercent,
+          status: 'error',
+          state: finalState,
+          currentStep: `Error: ${error.message}`,
+          eta: null,
+          errors: [...currentErrors, { itemId: 'SYNC_ERROR', error: error.message }]
+        });
+        
+        // Unregister sync job and rate limit callback
+        rateLimiter.unregisterSyncJob(syncJobId);
+        rateLimiter.unregisterRateLimitCallback(syncJobId);
+        this.clearRateLimitStatus(syncJobId);
+        
+        throw error;
+      }
     }
   }
+  
   
   /**
    * Handle rate limit event
    * retryAt is epoch milliseconds (timestamp) when retry should happen
    */
-  handleRateLimit(jobId, retryAt, errorCode = 429, errorMessage = 'Rate limit exceeded') {
+  async handleRateLimit(jobId, retryAt, errorCode = 429, errorMessage = 'Rate limit exceeded', retryAfterHeader = null) {
     // Only handle actual rate limits (429), not proactive pacing
     if (errorCode !== 429) {
       console.log(`ℹ️ [SyncService] Ignoring non-429 rate limit callback (errorCode: ${errorCode}) - this is proactive pacing, not a real rate limit`);
@@ -981,20 +1238,31 @@ class SyncService {
     }
     
     const progress = this.getSyncProgress(jobId);
-    if (!progress) return;
+    if (!progress) {
+      console.warn(`⚠️ [SyncService] handleRateLimit called but no progress found for jobId: ${jobId}`);
+      return;
+    }
     
     const now = Date.now();
     const retryAfterMs = Math.max(0, retryAt - now);
     const retryAfterSeconds = Math.ceil(retryAfterMs / 1000);
-    const retryAttemptCount = (progress.retryAttemptCount || 0) + 1;
     
-    // Store rate limit info
+    // Log 429 handling (this is called from rate limiter callback)
+    console.log(`🚨 [SyncService] handleRateLimit called - jobId: ${jobId}, retryAt: ${new Date(retryAt).toISOString()}, retryAfterHeader: "${retryAfterHeader || 'none'}", retryInSeconds: ${retryAfterSeconds}`);
+    
+    // Get existing rate limit info or create new
+    const existingRateLimitInfo = this.rateLimitStatus.get(jobId) || {};
+    const rateLimitCount = (existingRateLimitInfo.rateLimitCount || 0) + 1;
+    
+    // Store rate limit info with counter
     this.rateLimitStatus.set(jobId, {
       paused: true,
       pausedAt: now,
       retryAt: retryAt,
-      retryAttemptCount: retryAttemptCount,
-      isRealRateLimit: true // Flag to distinguish from proactive pacing
+      retryAttemptCount: (existingRateLimitInfo.retryAttemptCount || 0) + 1,
+      rateLimitCount: rateLimitCount,
+      isRealRateLimit: true, // Flag to distinguish from proactive pacing
+      retryAfterHeader: retryAfterHeader
     });
     
     // Update progress to PAUSED_RATE_LIMIT state (only for actual 429)
@@ -1006,14 +1274,41 @@ class SyncService {
       retryAt: retryAt,
       retryInMs: retryAfterMs,
       retryInSeconds: retryAfterSeconds,
-      retryAttemptCount: retryAttemptCount,
+      retryAttemptCount: existingRateLimitInfo.retryAttemptCount || 0,
+      rateLimitCount: rateLimitCount,
+      rateLimited: true,
       lastAttemptAt: now,
       lastErrorCode: errorCode,
       lastErrorMessage: errorMessage,
-      currentStep: `Sharetribe API limit reached (100 requests/min). Sync will resume in ${formatTime(retryAfterSeconds)}.`
+      currentStep: `Sharetribe API limit reached (100 requests/min). Sync will resume in ${formatTime(retryAfterSeconds)}.`,
+      updatedAt: now // Heartbeat
     });
     
-    console.log(`⏸️ [SyncService] Real rate limit hit (429) for job ${jobId}, paused until ${new Date(retryAt).toISOString()} (in ${retryAfterSeconds}s)`);
+    // Persist to database IMMEDIATELY (critical for persistence across restarts) IMMEDIATELY (critical for persistence across restarts)
+    await syncEventLogger.updateJobProgress(jobId, {
+      state: 'PAUSED_RATE_LIMIT',
+      retryAt: retryAt, // Absolute epoch ms timestamp
+      updatedAt: now, // Heartbeat
+      rateLimited: true,
+      rateLimitCount: rateLimitCount,
+      currentStep: `Sharetribe API limit reached (100 requests/min). Sync will resume in ${formatTime(retryAfterSeconds)}.`
+    }).catch(err => {
+      console.error(`[SyncService] Error updating job progress for rate limit:`, err);
+      // Don't throw - progress endpoint should never fail
+    });
+    
+    console.log(`⏸️ [SyncService] Real rate limit hit (429) for job ${jobId}, paused until ${new Date(retryAt).toISOString()} (in ${retryAfterSeconds}s), rateLimitCount: ${rateLimitCount}`);
+  }
+  
+  /**
+   * Calculate exponential backoff retry time
+   * Starts at 10s, doubles up to 60s max
+   */
+  calculateExponentialBackoff(retryCount) {
+    const baseDelay = 10; // 10 seconds
+    const maxDelay = 60; // 60 seconds max
+    const delay = Math.min(maxDelay, baseDelay * Math.pow(2, retryCount));
+    return delay * 1000; // Convert to milliseconds
   }
   
   /**

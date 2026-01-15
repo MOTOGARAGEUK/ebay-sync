@@ -21,9 +21,10 @@ const inFlightStatusRequests = new Map(); // jobId -> Promise
 const statusCache = new Map(); // jobId -> { data, expiresAt }
 
 // Simple rate limiter for admin endpoints (per IP)
+// RELAXED: High limits for dev/debugging, SSE exempted
 const adminRateLimitMap = new Map(); // ip -> { count, resetAt }
 const ADMIN_RATE_LIMIT_WINDOW = 1000; // 1 second
-const ADMIN_RATE_LIMIT_MAX = 1; // max 1 request per second
+const ADMIN_RATE_LIMIT_MAX = 10; // Increased to 10 req/sec for debugging (was 1)
 
 function getClientIP(req) {
   return req.ip || 
@@ -34,6 +35,11 @@ function getClientIP(req) {
 }
 
 function checkAdminRateLimit(req, res, next) {
+  // EXEMPT SSE streams from rate limiting entirely
+  if (req.path.includes('/events/stream')) {
+    return next(); // No rate limit for SSE
+  }
+  
   const ip = getClientIP(req);
   const now = Date.now();
   
@@ -47,10 +53,10 @@ function checkAdminRateLimit(req, res, next) {
   }
   
   if (limit.count >= ADMIN_RATE_LIMIT_MAX) {
-    // Rate limited
+    // Rate limited (but limit is now much higher: 10/sec)
     return res.status(429).json({ 
       error: 'Rate limit exceeded', 
-      message: 'Maximum 1 request per second for admin endpoints' 
+      message: `Maximum ${ADMIN_RATE_LIMIT_MAX} requests per second for admin endpoints` 
     });
   }
   
@@ -1737,12 +1743,12 @@ router.post('/sync', async (req, res) => {
         alreadyRunning: true,
         message: 'A sync job is already in progress. Attaching to existing job.',
         progress: activeProgress ? {
-          total: activeProgress.total,
-          completed: activeProgress.completed,
-          failed: activeProgress.failed,
-          percent: activeProgress.percent,
-          status: activeProgress.status,
-          currentStep: activeProgress.currentStep
+          total: activeProgress.total || 0,
+          completed: activeProgress.completed || 0,
+          failed: activeProgress.failed || 0,
+          percent: activeProgress.percent || 0,
+          status: activeProgress.status || 'in_progress',
+          currentStep: activeProgress.currentStep || 'Starting sync...'
         } : null
       };
       console.log(`📋 [API] Returning existing job: ${activeJobId}`);
@@ -1829,16 +1835,23 @@ router.post('/sync', async (req, res) => {
       // Start sync asynchronously (don't wait for completion)
       syncService.syncProducts(tenantId, item_ids, sharetribe_user_id, jobId)
         .then(result => {
-          console.log(`✅ [API] Sync completed for job ${jobId}:`, result);
+          console.log(`✅ [API] Sync result for job ${jobId}:`, result);
+          // Handle paused state (429) - don't log as completed yet
+          if (result && result.paused) {
+            console.log(`⏸️ [API] Sync paused (rate limit) for job ${jobId} - not logging as completed`);
+            return; // Don't update log - sync will resume automatically
+          }
           // Update log on completion
+          const synced = result?.synced || 0;
+          const failed = result?.failed || 0;
           dbInstance.run(
             `UPDATE sync_logs SET status = ?, products_synced = ?, products_failed = ?, completed_at = CURRENT_TIMESTAMP
              WHERE id = ?`,
-            [result.failed === 0 ? 'success' : 'partial', result.synced, result.failed, logId]
+            [failed === 0 ? 'success' : 'partial', synced, failed, logId]
           );
         })
         .catch(error => {
-          console.error(`❌ [API] Sync failed for job ${jobId}:`, error);
+          console.error(`❌ [API] Sync error for job ${jobId}:`, error);
           
           // Check if this is an "already running" error - if so, don't update progress as error
           const isAlreadyRunningError = error.message && error.message.includes('already in progress');
@@ -1848,23 +1861,41 @@ router.post('/sync', async (req, res) => {
             return;
           }
           
-          // Update progress with error (only for real errors)
+          // Check if this is a rate limit error (429) - should pause, not fail
+          const isRateLimitError = error.response?.status === 429 || 
+                                   error.status === 429 ||
+                                   error.message?.includes('rate limit') ||
+                                   error.message?.includes('429') ||
+                                   error.message?.includes('Too Many Requests');
+          
+          if (isRateLimitError) {
+            console.log(`⏸️ [API] Rate limit error (429) caught in API route - sync will pause and resume automatically`);
+            // Don't update progress to error - the sync service should have already set it to PAUSED_RATE_LIMIT
+            // Don't log as failed - it's just paused
+            return;
+          }
+          
+          // Get current progress safely
+          const currentProgress = syncService.getSyncProgress(jobId) || {};
+          
+          // Update progress with error (only for real errors, not 429s)
           syncService.updateSyncProgress(jobId, {
             jobId: jobId,
-            total: syncService.getSyncProgress(jobId)?.total || 0,
-            completed: syncService.getSyncProgress(jobId)?.completed || 0,
-            failed: syncService.getSyncProgress(jobId)?.failed || 0,
-            percent: syncService.getSyncProgress(jobId)?.percent || 0,
+            total: currentProgress.total || 0,
+            completed: currentProgress.completed || 0,
+            failed: currentProgress.failed || 0,
+            percent: currentProgress.percent || 0,
             status: 'error',
+            state: 'FAILED',
             currentStep: `Error: ${error.message}`,
             eta: null,
-            errors: [{ itemId: 'SYNC_ERROR', error: error.message }]
+            errors: currentProgress.errors || [{ itemId: 'SYNC_ERROR', error: error.message }]
           });
           // Log error
           dbInstance.run(
             `UPDATE sync_logs SET status = ?, products_failed = ?, error_message = ?, completed_at = CURRENT_TIMESTAMP
              WHERE id = ?`,
-            ['failed', 0, error.message, logId]
+            ['failed', currentProgress.failed || 0, error.message, logId]
           );
         });
     } catch (dbError) {
@@ -1928,13 +1959,13 @@ router.get('/sync/active', (req, res) => {
     console.log(`📋 [API] Active sync job found: ${activeProgress.jobId}`);
     res.json({
       active: true,
-      jobId: activeProgress.jobId,
-      status: activeProgress.status,
-      total: activeProgress.total,
-      completed: activeProgress.completed,
-      failed: activeProgress.failed,
-      percent: activeProgress.percent,
-      currentStep: activeProgress.currentStep,
+      jobId: activeProgress.jobId || null,
+      status: activeProgress.status || 'in_progress',
+      total: activeProgress.total || 0,
+      completed: activeProgress.completed || 0,
+      failed: activeProgress.failed || 0,
+      percent: activeProgress.percent || 0,
+      currentStep: activeProgress.currentStep || 'Starting sync...',
       startedAt: activeProgress.lastUpdate || Date.now()
     });
   } catch (error) {
@@ -1958,7 +1989,7 @@ router.get('/sync/progress/:jobId', (req, res) => {
     console.log(`📋 [API] Progress found for job ${jobId}:`, {
       total: progress.total,
       completed: progress.completed,
-      failed: progress.failed,
+      failed: progress.failed || 0,
       percent: progress.percent,
       status: progress.status,
       currentStep: progress.currentStep
@@ -2007,9 +2038,11 @@ router.get('/sync/progress/:jobId', (req, res) => {
       updatedAt: lastUpdate,
       lastAttemptAt: progress.lastAttemptAt || null,
       // Resume fields (always populated when PAUSED)
+      // CRITICAL: Always compute retryInSeconds from retryAt - now for dynamic countdown
       nextRetryAt: resumeAt,
-      retryAt: resumeAt, // Explicit resumeAt timestamp
+      retryAt: resumeAt, // Explicit resumeAt timestamp (absolute epoch ms)
       retryInMs: resumeAt ? Math.max(0, resumeAt - now) : null,
+      retryInSeconds: resumeAt ? Math.ceil(Math.max(0, resumeAt - now) / 1000) : null, // Always compute dynamically
       retryAttemptCount: progress.retryAttemptCount || 0,
       // Error fields
       lastErrorCode: progress.lastErrorCode || null,
@@ -2062,8 +2095,14 @@ router.get('/sync/progress/:jobId', (req, res) => {
     
     res.json(response);
   } catch (error) {
+    // Ensure progress endpoint never throws and never changes job state to FAILED
     console.error(`📋 [API] Error getting progress:`, error);
-    res.status(500).json({ error: error.message });
+    // Return a safe response - don't expose internal errors or change job state
+    res.status(500).json({ 
+      error: 'Failed to retrieve sync progress',
+      state: 'UNKNOWN', // Don't set FAILED
+      message: 'An error occurred while retrieving progress. The sync job may still be running.'
+    });
   }
 });
 
@@ -3667,6 +3706,11 @@ router.get('/admin/sync/jobs/:jobId/status', checkAdminRateLimit, async (req, re
         const processed = snapshot.processed !== null && snapshot.processed !== undefined ? snapshot.processed : ((snapshot.completed || 0) + (snapshot.failed || 0));
         const total = snapshot.total || 0;
         
+        // Compute retryInSeconds dynamically from retryAt - now
+        const now = Date.now();
+        const retryAtMs = snapshot.retry_at ? (typeof snapshot.retry_at === 'number' ? snapshot.retry_at : new Date(snapshot.retry_at).getTime()) : null;
+        const retryInSeconds = retryAtMs && retryAtMs > now ? Math.ceil((retryAtMs - now) / 1000) : null;
+        
         const response = {
           jobId: snapshot.job_id,
           state: snapshot.state || 'UNKNOWN',
@@ -3678,7 +3722,8 @@ router.get('/admin/sync/jobs/:jobId/status', checkAdminRateLimit, async (req, re
           percent: total > 0 ? Math.round((processed / total) * 100) : 0,
           currentProduct: snapshot.current_product_id || null,
           currentStep: snapshot.current_step || null,
-          retryAt: snapshot.retry_at || null,
+          retryAt: retryAtMs, // Absolute epoch ms timestamp
+          retryInSeconds: retryInSeconds, // Computed dynamically
           lastEventAt: snapshot.last_event_at || null,
           updatedAt: snapshot.updated_at || null,
           throttleSettings: {
@@ -3742,7 +3787,8 @@ router.get('/admin/sync/jobs/:jobId/status', checkAdminRateLimit, async (req, re
 router.get('/admin/sync/jobs/:jobId/events', checkAdminRateLimit, async (req, res) => {
   try {
     const { jobId } = req.params;
-    const limit = parseInt(req.query.limit) || 200;
+    // Reduced default limit to avoid heavy queries (was 200, now 100, max 200)
+    const limit = Math.min(parseInt(req.query.limit) || 100, 200);
     const cursor = req.query.cursor || null;
     
     const result = await syncEventLogger.getEvents(jobId, limit, cursor);
@@ -3754,8 +3800,9 @@ router.get('/admin/sync/jobs/:jobId/events', checkAdminRateLimit, async (req, re
 });
 
 // Live streaming events (SSE) - Real SSE endpoint
+// NO rate limiting - SSE streams must stay open (exempted in checkAdminRateLimit, but removed here for clarity)
 // INCLUDES STATUS IN PAYLOAD to avoid separate /status fetches
-router.get('/admin/sync/jobs/:jobId/events/stream', checkAdminRateLimit, async (req, res) => {
+router.get('/admin/sync/jobs/:jobId/events/stream', async (req, res) => {
   try {
     const { jobId } = req.params;
     

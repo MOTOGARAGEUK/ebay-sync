@@ -405,8 +405,21 @@ class SyncEventLogger {
     snapshot.failed = progress.failed !== undefined ? progress.failed : snapshot.failed;
     snapshot.current_product_id = progress.currentProductId || snapshot.current_product_id;
     snapshot.current_step = progress.currentStep || snapshot.current_step;
-    snapshot.retry_at = progress.retryAt || snapshot.retry_at;
-    snapshot.updated_at = now;
+    // CRITICAL: Ensure retryAt is stored as epoch ms (not Date object or string)
+    if (progress.retryAt !== undefined) {
+      if (progress.retryAt instanceof Date) {
+        snapshot.retry_at = progress.retryAt.getTime();
+      } else if (typeof progress.retryAt === 'string') {
+        snapshot.retry_at = new Date(progress.retryAt).getTime();
+      } else if (typeof progress.retryAt === 'number') {
+        snapshot.retry_at = progress.retryAt; // Already epoch ms
+      } else {
+        snapshot.retry_at = progress.retryAt;
+      }
+    } else {
+      snapshot.retry_at = snapshot.retry_at || null;
+    }
+    snapshot.updated_at = progress.updatedAt !== undefined ? progress.updatedAt : now;
     
     if (progress.throttleSettings) {
       snapshot.throttle_min_delay_ms = progress.throttleSettings.minDelayMs || snapshot.throttle_min_delay_ms;
@@ -551,7 +564,7 @@ class SyncEventLogger {
       
       dbInstance.all(`
         SELECT job_id FROM sync_jobs
-        WHERE updated_at > ? AND state IN ('RUNNING', 'PAUSED')
+        WHERE updated_at > ? AND state IN ('RUNNING', 'PAUSED_RATE_LIMIT', 'PAUSED')
         ORDER BY updated_at DESC
       `, [fiveMinutesAgo], (err, rows) => {
         if (err) {

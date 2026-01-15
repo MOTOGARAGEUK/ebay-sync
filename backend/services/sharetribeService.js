@@ -54,6 +54,20 @@ class ShareTribeService {
   }
   
   /**
+   * Create axios config with proper 429 handling
+   * validateStatus allows 429 to throw (so rate limiter can catch it)
+   */
+  createAxiosConfig() {
+    return {
+      validateStatus: function (status) {
+        // Allow 429 to throw (rate limiter needs to catch it)
+        // Allow other 4xx/5xx to return normally (we handle them)
+        return status < 500 && status !== 429;
+      }
+    };
+  }
+
+  /**
    * Execute request with event logging
    * Wraps rateLimiter.executeRequest and logs events
    */
@@ -114,6 +128,14 @@ class ShareTribeService {
           payloadSummary: payloadSummary,
           responseSnippet: responseSnippet
         });
+      }
+      
+      // Check if response is 429 - throw error so rate limiter can catch it
+      if (response.status === 429) {
+        const axiosError = new Error('Rate limit exceeded (429)');
+        axiosError.response = response;
+        axiosError.isAxiosError = true;
+        throw axiosError;
       }
       
       return response;
@@ -529,9 +551,7 @@ class ShareTribeService {
               params: {
                 include: 'images' // Request expanded images in response to verify attachment (ShareTribe expects comma-separated string)
               },
-              validateStatus: function (status) {
-                return status < 500; // Don't throw on 4xx errors, we'll handle them
-              }
+              ...this.createAxiosConfig() // Allow 429 to throw, other 4xx return normally
             }
           ),
           'post', // Update is a POST-type operation
@@ -591,15 +611,19 @@ class ShareTribeService {
             await new Promise(resolve => setTimeout(resolve, 1000));
             
             // Call the specific endpoint with include=images to verify images were attached
+            // Route verification GET through rate limiter
             const verifyUrl = `https://flex-integ-api.sharetribe.com/v1/integration_api/listings/show?id=${existingListingId}&include=images`;
             const verifyHeaders = await this.getAuthHeaders();
             
-            const verifyResponse = await axios.get(verifyUrl, {
-              headers: verifyHeaders,
-              validateStatus: function (status) {
-                return status < 500;
-              }
-            });
+            const verifyResponse = await this.executeRequestWithLogging(
+              () => axios.get(verifyUrl, {
+                headers: verifyHeaders,
+                ...this.createAxiosConfig() // Allow 429 to throw
+              }),
+              'get',
+              'verifyListingImages',
+              `/v1/integration_api/listings/show?id=${existingListingId}&include=images`
+            );
             
             console.log('=== Image Verification Response (After Update) ===');
             console.log('Status:', verifyResponse.status);
@@ -681,9 +705,7 @@ class ShareTribeService {
               params: {
                 include: 'images' // Request expanded images in response to verify attachment (ShareTribe expects comma-separated string)
               },
-              validateStatus: function (status) {
-                return status < 500; // Don't throw on 4xx errors, we'll handle them
-              }
+              ...this.createAxiosConfig() // Allow 429 to throw, other 4xx return normally
             }
           ),
           'create', // Creating listing uses 'create' endpoint type
@@ -965,15 +987,19 @@ class ShareTribeService {
             await new Promise(resolve => setTimeout(resolve, 1000));
             
             // Call the specific endpoint with include=images to verify images were attached
+            // Route verification GET through rate limiter
             const verifyUrl = `https://flex-integ-api.sharetribe.com/v1/integration_api/listings/show?id=${listingId}&include=images`;
             const verifyHeaders = await this.getAuthHeaders();
             
-            const verifyResponse = await axios.get(verifyUrl, {
-              headers: verifyHeaders,
-              validateStatus: function (status) {
-                return status < 500;
-              }
-            });
+            const verifyResponse = await this.executeRequestWithLogging(
+              () => axios.get(verifyUrl, {
+                headers: verifyHeaders,
+                ...this.createAxiosConfig() // Allow 429 to throw
+              }),
+              'get',
+              'verifyListingImages',
+              `/v1/integration_api/listings/show?id=${listingId}&include=images`
+            );
             
             console.log('=== Image Verification Response ===');
             console.log('Status:', verifyResponse.status);
@@ -2864,12 +2890,17 @@ class ShareTribeService {
       
       console.log(`Stock adjustment payload:`, JSON.stringify(payload, null, 2));
       
-      const response = await axios.post(apiUrl, payload, {
-        headers: headers,
-        validateStatus: function (status) {
-          return status < 500;
-        }
-      });
+      // Route setStock through rate limiter
+      const response = await this.executeRequestWithLogging(
+        () => axios.post(apiUrl, payload, {
+          headers: headers,
+          ...this.createAxiosConfig() // Allow 429 to throw
+        }),
+        'post',
+        'setStock',
+        '/v1/integration_api/stock_adjustments/create',
+        `listingId: ${listingId}, quantity: ${quantity}`
+      );
 
       if (response.status >= 200 && response.status < 300) {
         console.log(`✅ Successfully created stock adjustment - stock set to ${quantity} for listing ${listingId}`);
