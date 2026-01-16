@@ -1053,7 +1053,7 @@ const ProductsTab = () => {
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
                       {product.price && typeof product.price === 'number' 
-                        ? `${product.currency || 'GBP'} ${product.price.toFixed(2)}` 
+                        ? product.price.toFixed(2)
                         : product.price || 'N/A'}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">

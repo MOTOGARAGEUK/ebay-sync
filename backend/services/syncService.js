@@ -1786,7 +1786,7 @@ class SyncService {
                 productData.title || null,
                 productData.description || null,
                 productData.price || 0,
-                productData.currency || 'USD',
+                productData.currency || 'GBP', // Default to GBP instead of USD
                 productData.quantity || 0,
                 productData.images || null,
                 productData.category || null,
@@ -1805,7 +1805,7 @@ class SyncService {
                 productData.title || null,
                 productData.description || null,
                 productData.price || 0,
-                productData.currency || 'USD',
+                productData.currency || 'GBP', // Default to GBP instead of USD
                 productData.quantity || 0,
                 productData.images || null,
                 productData.category || null,
